@@ -1,1 +1,1 @@
-# jepa-symbolicgpt
+# symbolic-jepa
