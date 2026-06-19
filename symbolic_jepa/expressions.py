@@ -414,31 +414,49 @@ def load_synthetic_pkl(
     var_meta = [VarMeta(name='x', low=-math.pi, high=math.pi)]
 
     results: list[Expression] = []
-    n_failed = 0
+    n_parse = 0
+    n_tokenize = 0
+    n_too_long = 0
+    n_unk = 0
+    first_errors: list[str] = []
 
     for expr_str in expr_strings:
         sympy_expr = _synthetic_string_to_sympy(expr_str)
         if sympy_expr is None:
-            n_failed += 1
+            n_parse += 1
+            if len(first_errors) < 3:
+                first_errors.append(f"parse: {expr_str[:80]}")
             continue
 
         try:
             expr = Expression.from_sympy(sympy_expr, var_meta)
             ids = expr.tokenize(tokenizer)
-        except (ValueError, Exception):
-            n_failed += 1
+        except (ValueError, Exception) as e:
+            n_tokenize += 1
+            if len(first_errors) < 3:
+                first_errors.append(f"tokenize: {e}")
             continue
 
-        if len(ids) > max_seq_len or tokenizer.unk_id in ids:
-            n_failed += 1
+        if len(ids) > max_seq_len:
+            n_too_long += 1
+            continue
+        if tokenizer.unk_id in ids:
+            n_unk += 1
+            if len(first_errors) < 3:
+                unk_toks = [t for t in expr.prefix.split() if t not in tokenizer.token2id]
+                first_errors.append(f"unk tokens: {unk_toks}")
             continue
 
         results.append(expr)
 
+    n_failed = n_parse + n_tokenize + n_too_long + n_unk
     if n_failed > 0:
+        detail = (f"parse={n_parse}, tokenize={n_tokenize}, "
+                  f"too_long={n_too_long}, unk={n_unk}")
+        examples = "; ".join(first_errors) if first_errors else ""
         warnings.warn(
             f"Skipped {n_failed}/{len(expr_strings)} expressions "
-            f"(parse or tokenization failures)"
+            f"({detail}). Examples: {examples}"
         )
 
     return results
