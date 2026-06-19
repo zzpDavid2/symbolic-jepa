@@ -5,11 +5,26 @@ Includes constant fitting (BFGS), R² scoring, token accuracy,
 and algebraic equivalence checking.
 """
 
+import signal
 import numpy as np
 import sympy as sp
 from scipy.optimize import minimize
 
 from symbolic_jepa.tokenizer import prefix_to_sympy
+
+
+class _Timeout:
+    """Context manager that raises TimeoutError after `seconds`."""
+    def __init__(self, seconds):
+        self.seconds = seconds
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, self._handler)
+        signal.alarm(self.seconds)
+    def __exit__(self, *args):
+        signal.alarm(0)
+    @staticmethod
+    def _handler(signum, frame):
+        raise TimeoutError
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +105,7 @@ def fit_constants(expr, constants, X, Y, var_syms):
 # Equivalence checking
 # ---------------------------------------------------------------------------
 
-def equations_equivalent(pred_str: str, gt_str: str) -> bool:
+def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 5) -> bool:
     """Check if two prefix strings are algebraically equivalent."""
     try:
         pred_expr, _ = prefix_to_sympy(pred_str)
@@ -99,7 +114,8 @@ def equations_equivalent(pred_str: str, gt_str: str) -> bool:
         return False
 
     try:
-        diff = sp.simplify(pred_expr - gt_expr)
+        with _Timeout(timeout):
+            diff = sp.simplify(pred_expr - gt_expr)
         return diff.is_zero is True
     except Exception:
         return False
@@ -154,16 +170,17 @@ def evaluate_predictions(
         if i < len(dataset.samples):
             expr_obj = dataset.samples[i]['expr']
             try:
-                pred_expr, constants = prefix_to_sympy(pred_str)
-                cloud = expr_obj.sample(n_fit_points)
-                finite_mask = np.isfinite(cloud).all(axis=1)
-                cloud = cloud[finite_mask]
-                if len(cloud) >= 50:
-                    n_vars = len(expr_obj.variables)
-                    X = cloud[:, :n_vars]
-                    Y = cloud[:, n_vars]
-                    var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
-                    _, _, r2 = fit_constants(pred_expr, constants, X, Y, var_syms)
+                with _Timeout(10):
+                    pred_expr, constants = prefix_to_sympy(pred_str)
+                    cloud = expr_obj.sample(n_fit_points)
+                    finite_mask = np.isfinite(cloud).all(axis=1)
+                    cloud = cloud[finite_mask]
+                    if len(cloud) >= 50:
+                        n_vars = len(expr_obj.variables)
+                        X = cloud[:, :n_vars]
+                        Y = cloud[:, n_vars]
+                        var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
+                        _, _, r2 = fit_constants(pred_expr, constants, X, Y, var_syms)
             except Exception:
                 pass
 
