@@ -15,6 +15,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import sympy as sp
+import sympy.assumptions  # force lazy submodule load (fixes Python 3.12)
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations,
     implicit_multiplication_application, convert_xor, implicit_application,
