@@ -5,26 +5,26 @@ Includes constant fitting (BFGS), R² scoring, token accuracy,
 and algebraic equivalence checking.
 """
 
-import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
 import numpy as np
 import sympy as sp
 from scipy.optimize import minimize
+from tqdm.auto import tqdm
 
 from symbolic_jepa.tokenizer import prefix_to_sympy
 
 
-class _Timeout:
-    """Context manager that raises TimeoutError after `seconds`."""
-    def __init__(self, seconds):
-        self.seconds = seconds
-    def __enter__(self):
-        signal.signal(signal.SIGALRM, self._handler)
-        signal.alarm(self.seconds)
-    def __exit__(self, *args):
-        signal.alarm(0)
-    @staticmethod
-    def _handler(signum, frame):
-        raise TimeoutError
+def _run_with_timeout(fn, timeout):
+    """Run fn() in a thread with a timeout. Returns None on timeout/error."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except (FuturesTimeout, Exception):
+        return None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def teacher_forced_accuracy(logits, targets, pad_id: int) -> float:
 # Constant fitting
 # ---------------------------------------------------------------------------
 
-def fit_constants(expr, constants, X, Y, var_syms):
+def fit_constants(expr, constants, X, Y, var_syms, maxiter=100):
     """Fit fittable constants in a predicted expression using L-BFGS-B.
 
     Args:
@@ -66,6 +66,7 @@ def fit_constants(expr, constants, X, Y, var_syms):
         X: (n_points, n_vars) input data.
         Y: (n_points,) target output.
         var_syms: List of SymPy Symbols for input variables.
+        maxiter: Maximum BFGS iterations.
 
     Returns:
         (fitted_dict, Y_pred, r2) or (None, None, -inf) on failure.
@@ -91,13 +92,16 @@ def fit_constants(expr, constants, X, Y, var_syms):
                 return 1e10
 
     r = minimize(loss, np.ones(len(constants)), method='L-BFGS-B',
-                 options={'maxiter': 300})
+                 options={'maxiter': maxiter})
 
     if not np.isfinite(r.fun) or r.fun >= 1e9:
         return None, None, -np.inf
 
     fitted = dict(zip([str(c) for c in constants], r.x))
-    Y_pred = np.asarray(f(*X.T, *r.x), dtype=float)
+    with np.errstate(all='ignore'):
+        Y_pred = np.asarray(f(*X.T, *r.x), dtype=float)
+    if not np.all(np.isfinite(Y_pred)):
+        return None, None, -np.inf
     return fitted, Y_pred, r2_score(Y, Y_pred)
 
 
@@ -105,7 +109,7 @@ def fit_constants(expr, constants, X, Y, var_syms):
 # Equivalence checking
 # ---------------------------------------------------------------------------
 
-def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 5) -> bool:
+def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 1) -> bool:
     """Check if two prefix strings are algebraically equivalent."""
     try:
         pred_expr, _ = prefix_to_sympy(pred_str)
@@ -113,12 +117,12 @@ def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 5) -> bool:
     except Exception:
         return False
 
-    try:
-        with _Timeout(timeout):
-            diff = sp.simplify(pred_expr - gt_expr)
+    def _check():
+        diff = sp.simplify(pred_expr - gt_expr)
         return diff.is_zero is True
-    except Exception:
-        return False
+
+    result = _run_with_timeout(_check, timeout)
+    return result is True
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +133,8 @@ def evaluate_predictions(
     predictions: list[tuple[str, str]],
     dataset,
     tokenizer,
-    n_fit_points: int = 1000,
+    n_fit_points: int = 200,
+    fit_timeout: int = 2,
 ) -> dict:
     """Evaluate a list of (gt_prefix, pred_prefix) pairs.
 
@@ -138,6 +143,7 @@ def evaluate_predictions(
         dataset: PointCloudDataset (for sampling evaluation points).
         tokenizer: PrefixTokenizer.
         n_fit_points: Number of points for constant fitting.
+        fit_timeout: Timeout in seconds for each R² fit attempt.
 
     Returns:
         Dict with 'exact_match', 'token_accuracy', 'algebraic_equiv',
@@ -149,7 +155,8 @@ def evaluate_predictions(
     r2_scores = []
     details = []
 
-    for i, (gt_str, pred_str) in enumerate(predictions):
+    pbar = tqdm(predictions, desc='evaluate', leave=False)
+    for i, (gt_str, pred_str) in enumerate(pbar):
         # Exact match
         exact = int(pred_str.strip() == gt_str.strip())
         exact_matches.append(exact)
@@ -162,35 +169,46 @@ def evaluate_predictions(
             hits = sum(p == g for p, g in zip(pred_tokens[:min_len], gt_tokens[:min_len]))
             token_accs.append(hits / max(len(pred_tokens), len(gt_tokens)))
 
-        # Algebraic equivalence
-        algebraic_matches.append(int(equations_equivalent(pred_str, gt_str)))
+        # Algebraic equivalence — skip expensive simplify for exact matches
+        if exact:
+            algebraic_matches.append(1)
+        else:
+            algebraic_matches.append(int(equations_equivalent(pred_str, gt_str)))
 
-        # R² via constant fitting
+        # R² via constant fitting (thread-based timeout)
         r2 = None
         if i < len(dataset.samples):
             expr_obj = dataset.samples[i]['expr']
-            try:
-                with _Timeout(10):
-                    pred_expr, constants = prefix_to_sympy(pred_str)
-                    cloud = expr_obj.sample(n_fit_points)
-                    finite_mask = np.isfinite(cloud).all(axis=1)
-                    cloud = cloud[finite_mask]
-                    if len(cloud) >= 50:
-                        n_vars = len(expr_obj.variables)
-                        X = cloud[:, :n_vars]
-                        Y = cloud[:, n_vars]
-                        var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
-                        _, _, r2 = fit_constants(pred_expr, constants, X, Y, var_syms)
-            except Exception:
-                pass
 
-        if r2 is not None:
+            def _fit_r2():
+                pred_expr, constants = prefix_to_sympy(pred_str)
+                cloud = expr_obj.sample(n_fit_points)
+                finite_mask = np.isfinite(cloud).all(axis=1)
+                cloud = cloud[finite_mask]
+                if len(cloud) < 50:
+                    return None
+                n_vars = len(expr_obj.variables)
+                X = cloud[:, :n_vars]
+                Y = cloud[:, n_vars]
+                var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
+                _, _, r2_val = fit_constants(pred_expr, constants, X, Y, var_syms)
+                return r2_val
+
+            r2 = _run_with_timeout(_fit_r2, fit_timeout)
+
+        if r2 is not None and np.isfinite(r2):
             r2_scores.append(r2)
 
         details.append({
             'gt': gt_str, 'pred': pred_str,
             'exact': exact, 'r2': r2,
         })
+
+        # Update progress bar with running stats
+        if (i + 1) % 20 == 0:
+            em = np.mean(exact_matches) * 100
+            eq = np.mean(algebraic_matches) * 100
+            pbar.set_postfix(exact=f'{em:.0f}%', equiv=f'{eq:.0f}%')
 
     n = len(predictions)
     results = {
