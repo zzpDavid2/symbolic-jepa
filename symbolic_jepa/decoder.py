@@ -74,7 +74,7 @@ class SymbolicTransformer(nn.Module):
         return {'loss': loss, 'logits': logits}
 
     def encode_expression(self, input_ids, attn_mask=None):
-        """Encode equation tokens without data token -> mean-pooled z_sym.
+        """Encode equation tokens without data token -> last-token-pooled z_sym.
 
         Used for JEPA alignment: produces a symbolic embedding that depends
         only on the expression (no numeric point-cloud information).
@@ -83,7 +83,7 @@ class SymbolicTransformer(nn.Module):
             input_ids: (batch, seq) token IDs.
             attn_mask: (batch, seq) 1 for real tokens, 0 for padding.
         Returns:
-            (batch, d_model) mean-pooled representation.
+            (batch, d_model) last-token-pooled representation.
         """
         batch, seq = input_ids.shape
         tok_emb = self.tok_embed(input_ids)
@@ -101,11 +101,12 @@ class SymbolicTransformer(nn.Module):
             self.transformer(x, mask=causal, src_key_padding_mask=key_padding_mask)
         )  # (batch, seq, d_model)
 
-        # Mean-pool over non-pad positions
+        # Last non-pad token (sees full expression via causal attention)
         if attn_mask is not None:
-            mask_f = attn_mask.unsqueeze(-1).float()  # (batch, seq, 1)
-            return (h * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
-        return h.mean(dim=1)
+            lengths = attn_mask.sum(dim=1).long()       # (batch,)
+            last_idx = (lengths - 1).clamp(min=0)       # (batch,)
+            return h[torch.arange(batch, device=h.device), last_idx]
+        return h[:, -1]
 
     @torch.no_grad()
     def generate(self, points, tokenizer, max_new_tokens: int = 64):
