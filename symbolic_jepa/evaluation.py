@@ -175,9 +175,17 @@ def evaluate_predictions(
         else:
             algebraic_matches.append(int(equations_equivalent(pred_str, gt_str)))
 
+        # Parse check
+        parseable = False
+        try:
+            prefix_to_sympy(pred_str)
+            parseable = True
+        except Exception:
+            pass
+
         # R² via constant fitting (thread-based timeout)
         r2 = None
-        if i < len(dataset.samples):
+        if parseable and i < len(dataset.samples):
             expr_obj = dataset.samples[i]['expr']
 
             def _fit_r2():
@@ -201,7 +209,7 @@ def evaluate_predictions(
 
         details.append({
             'gt': gt_str, 'pred': pred_str,
-            'exact': exact, 'r2': r2,
+            'exact': exact, 'r2': r2, 'parseable': parseable,
         })
 
         # Update progress bar with running stats
@@ -218,7 +226,7 @@ def evaluate_predictions(
         'mean_r2': np.mean(r2_scores) if r2_scores else float('nan'),
         'median_r2': np.median(r2_scores) if r2_scores else float('nan'),
         'r2_above_0.9': np.mean([r > 0.9 for r in r2_scores]) if r2_scores else 0,
-        'n_parseable': len(r2_scores),
+        'n_parseable': sum(1 for d in details if d['parseable']),
         'n_total': n,
         'details': details,
     }
