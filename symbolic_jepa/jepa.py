@@ -23,14 +23,23 @@ class JEPAPredictor(nn.Module):
         return self.net(z_num)
 
 
-def jepa_loss(z_pred: torch.Tensor, z_sym_detached: torch.Tensor) -> torch.Tensor:
+def jepa_loss(
+    z_pred: torch.Tensor,
+    z_sym_detached: torch.Tensor,
+    mode: str = "centered",
+) -> torch.Tensor:
     """Cosine alignment loss: (1 - cosine_similarity).mean().
 
     Args:
         z_pred: (batch, d_model) from predictor(z_num).
         z_sym_detached: (batch, d_model) — must already be detached.
+        mode: "centered" subtracts batch mean before cosine (default);
+              "raw" uses vectors as-is.
     Returns:
         Scalar loss in [0, 2].
     """
+    if mode == "centered":
+        z_pred = z_pred - z_pred.mean(0)
+        z_sym_detached = z_sym_detached - z_sym_detached.mean(0)
     cos = F.cosine_similarity(z_pred, z_sym_detached, dim=-1)
     return (1 - cos).mean()

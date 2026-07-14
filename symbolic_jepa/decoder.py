@@ -34,15 +34,16 @@ class SymbolicTransformer(nn.Module):
 
     def _build_inputs(self, points, input_ids):
         batch, seq = input_ids.shape
-        data_token = self.encoder(points).unsqueeze(1)  # (batch, 1, d_model)
+        z_num = self.encoder(points)                     # (batch, d_model)
+        data_token = z_num.unsqueeze(1)                  # (batch, 1, d_model)
         tok_emb = self.tok_embed(input_ids)
         x = torch.cat([data_token, tok_emb], dim=1)
         pos = torch.arange(seq + 1, device=x.device)
         x = x + self.pos_embed(pos).unsqueeze(0)
-        return self.drop(x)
+        return self.drop(x), z_num
 
     def forward(self, points, input_ids, attn_mask=None):
-        x = self._build_inputs(points, input_ids)
+        x, z_num = self._build_inputs(points, input_ids)
         seq_len = x.shape[1]
 
         causal = torch.triu(
@@ -71,7 +72,7 @@ class SymbolicTransformer(nn.Module):
             targets.reshape(-1),
             ignore_index=self.pad_id,
         )
-        return {'loss': loss, 'logits': logits}
+        return {'loss': loss, 'logits': logits, 'z_num': z_num}
 
     def encode_expression(self, input_ids, attn_mask=None):
         """Encode equation tokens without data token -> last-token-pooled z_sym.

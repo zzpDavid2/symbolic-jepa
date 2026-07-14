@@ -8,3 +8,6 @@ from symbolic_jepa.evaluation import (
     r2_score, teacher_forced_accuracy, fit_constants,
     equations_equivalent, evaluate_predictions,
 )
+from symbolic_jepa.diagnostics import (
+    sym_spread, pred_spread, retrieval_top1, common_mode,
+)
