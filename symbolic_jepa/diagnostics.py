@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 def _pairwise_cos(z: torch.Tensor) -> torch.Tensor:
     """Return (B, B) pairwise cosine similarity matrix."""
-    z_norm = F.normalize(z, dim=-1)
+    z_norm = F.normalize(z.float(), dim=-1)
     return z_norm @ z_norm.T
 
 
@@ -48,12 +48,13 @@ def retrieval_top1(z_pred: torch.Tensor, z_sym: torch.Tensor) -> dict:
     B = z_pred.shape[0]
 
     # Raw
-    cos_raw = F.normalize(z_pred, dim=-1) @ F.normalize(z_sym, dim=-1).T
+    zp_f, zs_f = z_pred.float(), z_sym.float()
+    cos_raw = F.normalize(zp_f, dim=-1) @ F.normalize(zs_f, dim=-1).T
     acc_raw = (cos_raw.argmax(dim=1) == torch.arange(B, device=z_pred.device)).float().mean().item()
 
     # Centered
-    zp = z_pred - z_pred.mean(0)
-    zs = z_sym - z_sym.mean(0)
+    zp = zp_f - zp_f.mean(0)
+    zs = zs_f - zs_f.mean(0)
     cos_cent = F.normalize(zp, dim=-1) @ F.normalize(zs, dim=-1).T
     acc_cent = (cos_cent.argmax(dim=1) == torch.arange(B, device=z_pred.device)).float().mean().item()
 
@@ -66,6 +67,7 @@ def common_mode(z: torch.Tensor) -> dict:
     mean_norm_ratio = ||mean(z)|| / mean(||z||).  Close to 1 = strong common mode.
     pc_var_share = fraction of variance in top-3 PCs (via pca_lowrank).
     """
+    z = z.float()
     mean_vec = z.mean(0)
     mean_norm = mean_vec.norm().item()
     avg_norm = z.norm(dim=-1).mean().item()
