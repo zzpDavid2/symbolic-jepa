@@ -109,17 +109,44 @@ def fit_constants(expr, constants, X, Y, var_syms, maxiter=100):
 # Equivalence checking
 # ---------------------------------------------------------------------------
 
-def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 1) -> bool:
-    """Check if two prefix strings are algebraically equivalent."""
+def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
+    """Check if two prefix strings are algebraically equivalent.
+
+    Handles commutativity (SymPy normalizes) and constant permutation
+    (c_0, c_1, ... may map differently between pred and gt).
+    """
     try:
-        pred_expr, _ = prefix_to_sympy(pred_str)
-        gt_expr, _ = prefix_to_sympy(gt_str)
+        pred_expr, pred_consts = prefix_to_sympy(pred_str)
+        gt_expr, gt_consts = prefix_to_sympy(gt_str)
     except Exception:
         return False
 
     def _check():
+        # Fast path: identical SymPy expressions (handles commutativity)
+        if pred_expr.equals(gt_expr):
+            return True
+
+        # Try simplify on the difference (works when constants align)
         diff = sp.simplify(pred_expr - gt_expr)
-        return diff.is_zero is True
+        if diff.is_zero is True:
+            return True
+
+        # Constant permutation: if same number of constants, try all
+        # permutations of pred constants to match gt constants.
+        # (Constants are fittable, so c_0*x + c_1 ≡ c_1*x + c_0.)
+        n_pred, n_gt = len(pred_consts), len(gt_consts)
+        if n_pred == n_gt and 0 < n_pred <= 6:
+            from itertools import permutations
+            for perm in permutations(pred_consts):
+                sub = dict(zip(perm, gt_consts))
+                remapped = pred_expr.subs(sub)
+                if remapped.equals(gt_expr):
+                    return True
+                diff2 = sp.simplify(remapped - gt_expr)
+                if diff2.is_zero is True:
+                    return True
+
+        return False
 
     result = _run_with_timeout(_check, timeout)
     return result is True
@@ -171,9 +198,10 @@ def evaluate_predictions(
 
         # Algebraic equivalence — skip expensive simplify for exact matches
         if exact:
-            algebraic_matches.append(1)
+            equiv = 1
         else:
-            algebraic_matches.append(int(equations_equivalent(pred_str, gt_str)))
+            equiv = int(equations_equivalent(pred_str, gt_str))
+        algebraic_matches.append(equiv)
 
         # Parse check
         parseable = False
@@ -209,7 +237,7 @@ def evaluate_predictions(
 
         details.append({
             'gt': gt_str, 'pred': pred_str,
-            'exact': exact, 'r2': r2, 'parseable': parseable,
+            'exact': exact, 'equiv': equiv, 'r2': r2, 'parseable': parseable,
         })
 
         # Update progress bar with running stats
