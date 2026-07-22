@@ -6,7 +6,7 @@ from symbolic_jepa.jepa import JEPAPredictor, IdentityPredictor, jepa_loss
 from symbolic_jepa.dataset import PointCloudDataset, build_feynman_splits, build_synthetic_splits
 from symbolic_jepa.evaluation import (
     r2_score, teacher_forced_accuracy, fit_constants,
-    equations_equivalent, evaluate_predictions,
+    equations_equivalent, evaluate_predictions, cleanup_eval_pool,
 )
 from symbolic_jepa.diagnostics import (
     sym_spread, pred_spread, retrieval_top1, common_mode,

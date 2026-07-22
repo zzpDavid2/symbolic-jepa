@@ -14,17 +14,43 @@ from tqdm.auto import tqdm
 
 from symbolic_jepa.tokenizer import prefix_to_sympy
 
+# Shared thread pool for timeout-guarded evaluations.
+# Re-using a single pool avoids creating (and leaking) a new
+# ThreadPoolExecutor + thread per call.
+_EVAL_POOL: ThreadPoolExecutor | None = None
+
+
+def _get_eval_pool() -> ThreadPoolExecutor:
+    global _EVAL_POOL
+    if _EVAL_POOL is None:
+        _EVAL_POOL = ThreadPoolExecutor(max_workers=2)
+    return _EVAL_POOL
+
+
+def cleanup_eval_pool():
+    """Shut down the shared evaluation thread pool and wait for threads.
+
+    Call this after evaluate_predictions() to ensure no zombie threads
+    linger into the next training run.
+    """
+    global _EVAL_POOL
+    if _EVAL_POOL is not None:
+        _EVAL_POOL.shutdown(wait=True, cancel_futures=True)
+        _EVAL_POOL = None
+
 
 def _run_with_timeout(fn, timeout):
-    """Run fn() in a thread with a timeout. Returns None on timeout/error."""
-    pool = ThreadPoolExecutor(max_workers=1)
+    """Run fn() in a thread with a timeout. Returns None on timeout/error.
+
+    Uses a shared thread pool to avoid per-call pool creation.
+    """
+    pool = _get_eval_pool()
     future = pool.submit(fn)
     try:
         return future.result(timeout=timeout)
     except (FuturesTimeout, Exception):
+        future.cancel()
         return None
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
