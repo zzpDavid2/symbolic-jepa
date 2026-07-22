@@ -5,7 +5,8 @@ Includes constant fitting (BFGS), R² scoring, token accuracy,
 and algebraic equivalence checking.
 """
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+import signal
+import threading
 
 import numpy as np
 import sympy as sp
@@ -14,44 +15,60 @@ from tqdm.auto import tqdm
 
 from symbolic_jepa.tokenizer import prefix_to_sympy
 
-# Shared thread pool for timeout-guarded evaluations.
-# Re-using a single pool avoids creating (and leaking) a new
-# ThreadPoolExecutor + thread per call.
-_EVAL_POOL: ThreadPoolExecutor | None = None
-
-
-def _get_eval_pool() -> ThreadPoolExecutor:
-    global _EVAL_POOL
-    if _EVAL_POOL is None:
-        _EVAL_POOL = ThreadPoolExecutor(max_workers=2)
-    return _EVAL_POOL
-
 
 def cleanup_eval_pool():
-    """Shut down the shared evaluation thread pool.
+    """No-op — kept for backward compatibility with notebook code.
 
-    Uses wait=False so we never block on stuck sympy threads.
-    cancel_futures=True drops any queued-but-not-started work.
-    A fresh pool is created lazily on the next call.
+    Signal-based timeouts don't use a pool, so nothing to clean up.
     """
-    global _EVAL_POOL
-    if _EVAL_POOL is not None:
-        _EVAL_POOL.shutdown(wait=False, cancel_futures=True)
-        _EVAL_POOL = None
+    pass
 
 
 def _run_with_timeout(fn, timeout):
-    """Run fn() in a thread with a timeout. Returns None on timeout/error.
+    """Run fn() with a hard timeout. Returns None on timeout/error.
 
-    Uses a shared thread pool to avoid per-call pool creation.
+    On Unix main thread: uses SIGALRM to actually interrupt stuck work
+    (sympy simplify, BFGS fitting, etc.). No zombie threads.
+    Fallback: daemon thread (stuck work may linger briefly).
     """
-    pool = _get_eval_pool()
-    future = pool.submit(fn)
+    if (hasattr(signal, 'SIGALRM')
+            and threading.current_thread() is threading.main_thread()):
+        return _signal_timeout(fn, timeout)
+    return _thread_timeout(fn, timeout)
+
+
+def _signal_timeout(fn, timeout):
+    """SIGALRM-based timeout — actually kills stuck work."""
+    def _handler(signum, frame):
+        raise TimeoutError()
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
     try:
-        return future.result(timeout=timeout)
-    except (FuturesTimeout, Exception):
-        future.cancel()
+        return fn()
+    except (TimeoutError, Exception):
         return None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _thread_timeout(fn, timeout):
+    """Thread-based timeout fallback (non-Unix / non-main-thread)."""
+    result = [None]
+    ok = [False]
+
+    def _target():
+        try:
+            result[0] = fn()
+            ok[0] = True
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    return result[0] if ok[0] else None
 
 
 # ---------------------------------------------------------------------------
