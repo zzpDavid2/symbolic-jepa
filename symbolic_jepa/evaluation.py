@@ -28,14 +28,15 @@ def _get_eval_pool() -> ThreadPoolExecutor:
 
 
 def cleanup_eval_pool():
-    """Shut down the shared evaluation thread pool and wait for threads.
+    """Shut down the shared evaluation thread pool.
 
-    Call this after evaluate_predictions() to ensure no zombie threads
-    linger into the next training run.
+    Uses wait=False so we never block on stuck sympy threads.
+    cancel_futures=True drops any queued-but-not-started work.
+    A fresh pool is created lazily on the next call.
     """
     global _EVAL_POOL
     if _EVAL_POOL is not None:
-        _EVAL_POOL.shutdown(wait=True, cancel_futures=True)
+        _EVAL_POOL.shutdown(wait=False, cancel_futures=True)
         _EVAL_POOL = None
 
 
