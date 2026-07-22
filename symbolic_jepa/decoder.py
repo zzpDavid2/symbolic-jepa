@@ -64,8 +64,11 @@ class SymbolicTransformer(nn.Module):
         h = self.norm(h)
         logits = self.head(h)  # (batch, 1+seq_len, vocab_size)
 
-        pred_logits = logits[:, :-1, :]
-        targets = input_ids
+        # logits[:, 0, :] is the data-token predicting <sos> — trivially
+        # learnable and inflates metrics.  Skip it: targets start at position 1
+        # of input_ids (the first real equation token after <sos>).
+        pred_logits = logits[:, 1:-1, :]      # (batch, seq-1, vocab)
+        targets = input_ids[:, 1:]             # (batch, seq-1)
 
         loss = F.cross_entropy(
             pred_logits.reshape(-1, pred_logits.size(-1)),

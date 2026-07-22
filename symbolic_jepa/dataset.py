@@ -12,12 +12,16 @@ from torch.utils.data import Dataset
 from symbolic_jepa.expressions import Expression, load_feynman_csv
 from symbolic_jepa.tokenizer import PrefixTokenizer
 
+# Fixed seed for deterministic eval point clouds, independent of model seed.
+_EVAL_DATA_SEED = 999_999_937
+
 
 class PointCloudDataset(Dataset):
     """Dataset of (point_cloud, token_ids) pairs.
 
-    Each call to __getitem__ freshly samples the point cloud from the
-    Expression, providing infinite augmentation.
+    When resample=True (train), each __getitem__ freshly samples the point
+    cloud, providing infinite augmentation.  When resample=False (val/test),
+    point clouds are deterministic: seeded by a fixed data seed + sample index.
     """
 
     def __init__(
@@ -38,6 +42,7 @@ class PointCloudDataset(Dataset):
 
         # Pre-tokenize and filter
         self.samples: list[dict] = []
+        n_dropped_cloud = 0
         for expr in expressions:
             try:
                 ids = expr.tokenize(tokenizer)
@@ -47,6 +52,12 @@ class PointCloudDataset(Dataset):
             if len(ids) > max_seq_len or tokenizer.unk_id in ids:
                 continue
 
+            # Validate that the expression can produce enough finite points.
+            # Use a deterministic probe seed so this check is reproducible.
+            if not self._probe_valid(expr, n_points):
+                n_dropped_cloud += 1
+                continue
+
             pad = max_seq_len - len(ids)
             self.samples.append({
                 'expr': expr,
@@ -54,48 +65,83 @@ class PointCloudDataset(Dataset):
                 'attn_mask': torch.tensor([1] * len(ids) + [0] * pad, dtype=torch.long),
             })
 
+        if n_dropped_cloud > 0:
+            import warnings
+            warnings.warn(
+                f"Dropped {n_dropped_cloud} expression(s) that could not "
+                f"produce >= 10 finite points."
+            )
+
+    @staticmethod
+    def _probe_valid(expr: Expression, n_points: int, n_tries: int = 3) -> bool:
+        """Return True if *expr* can produce >= 10 finite points.
+
+        Retries up to *n_tries* times with different deterministic seeds.
+        """
+        for attempt in range(n_tries):
+            rng = np.random.RandomState(seed=_EVAL_DATA_SEED + attempt)
+            cloud = expr.sample(n_points, method='uniform', rng=rng)
+            finite = np.isfinite(cloud).all(axis=1).sum()
+            if finite >= 10:
+                return True
+        return False
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        points = self._sample_points(s['expr'])
+        points = self._sample_points(s['expr'], idx)
         return {
             'points': points,
             'input_ids': s['input_ids'],
             'attn_mask': s['attn_mask'],
         }
 
-    def _sample_points(self, expr: Expression) -> torch.Tensor:
-        """Sample, normalize, and pad a point cloud from the expression."""
-        cloud = expr.sample(self.n_points, method='uniform')  # (n_points, n_vars+1)
+    def _sample_points(self, expr: Expression, idx: int) -> torch.Tensor:
+        """Sample, normalize, and pad a point cloud from the expression.
+
+        When resample=False (val/test), uses a deterministic RNG seeded by
+        _EVAL_DATA_SEED + idx so repeated access gives the same cloud and
+        the model training seed has no effect.
+        """
+        if not self.resample:
+            rng = np.random.RandomState(_EVAL_DATA_SEED + idx)
+        else:
+            rng = None  # use global numpy RNG (stochastic)
+
+        cloud = expr.sample(self.n_points, method='uniform', rng=rng)
 
         # Filter non-finite rows
         finite_mask = np.isfinite(cloud).all(axis=1)
         cloud = cloud[finite_mask]
 
         if len(cloud) < 10:
-            # Fallback: return zeros if expression is badly behaved
-            return torch.zeros(self.n_points, self.target_d, dtype=torch.float32)
+            raise RuntimeError(
+                f"Expression {expr!r} produced fewer than 10 finite points "
+                f"({len(cloud)} of {self.n_points}). Cannot build a valid "
+                f"point cloud — this expression should be dropped."
+            )
 
         # Pad or truncate to n_points
         if len(cloud) >= self.n_points:
             if self.resample:
-                idx = np.random.choice(len(cloud), self.n_points, replace=False)
-                cloud = cloud[idx]
+                choice_idx = np.random.choice(len(cloud), self.n_points, replace=False)
+                cloud = cloud[choice_idx]
             else:
                 cloud = cloud[:self.n_points]
         else:
-            # Repeat with noise if too few valid points
+            # Repeat existing points to fill to n_points
             n_need = self.n_points - len(cloud)
-            extra_idx = np.random.choice(len(cloud), n_need, replace=True)
+            src_rng = rng if rng is not None else np.random
+            extra_idx = src_rng.choice(len(cloud), n_need, replace=True)
             cloud = np.vstack([cloud, cloud[extra_idx]])
 
         # Normalize per-column
         cloud = (cloud - cloud.mean(axis=0)) / (cloud.std(axis=0) + 1e-8)
 
         # Pad dimensions to target_d
-        n, d = cloud.shape
+        _, d = cloud.shape
         if d < self.target_d:
             cloud = np.pad(cloud, ((0, 0), (0, self.target_d - d)))
         else:

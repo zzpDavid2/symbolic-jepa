@@ -41,14 +41,19 @@ def r2_score(Y: np.ndarray, Y_pred: np.ndarray) -> float:
 def teacher_forced_accuracy(logits, targets, pad_id: int) -> float:
     """Fraction of non-pad positions where argmax matches target.
 
+    Excludes the trivial data-token → <sos> prediction (position 0).
+
     Args:
         logits: (batch, 1+seq, vocab) — includes data-token position.
         targets: (batch, seq) — ground-truth token IDs.
         pad_id: Token ID used for padding.
     """
-    pred = logits[:, :-1, :].argmax(dim=-1)  # (batch, seq)
-    mask = (targets != pad_id)
-    correct = ((pred == targets) & mask).float().sum()
+    # logits[:, 1:-1, :] → predictions from <sos> onward (skipping data-token)
+    # targets[:, 1:]     → ground-truth after <sos>
+    pred = logits[:, 1:-1, :].argmax(dim=-1)   # (batch, seq-1)
+    tgt = targets[:, 1:]                        # (batch, seq-1)
+    mask = (tgt != pad_id)
+    correct = ((pred == tgt) & mask).float().sum()
     total = mask.float().sum()
     return (correct / (total + 1e-10)).item()
 

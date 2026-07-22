@@ -171,7 +171,8 @@ class Expression:
         return np.broadcast_to(np.asarray(result, dtype=float), (points.shape[0],)).copy()
 
     def sample(self, n_points: int = 200,
-               method: str = 'uniform') -> np.ndarray:
+               method: str = 'uniform',
+               rng: np.random.RandomState | None = None) -> np.ndarray:
         """Sample a point cloud from this expression.
 
         Args:
@@ -179,15 +180,18 @@ class Expression:
             method: 'uniform' (random within bounds),
                     'grid' (linspace, univariate only),
                     'lhs' (Latin hypercube).
+            rng: Optional RandomState for deterministic sampling.
+                 If None, uses the global numpy RNG.
 
         Returns:
             (n_points, n_vars + 1) array — input columns + output column.
         """
         n_vars = len(self._variables)
+        _rng = rng if rng is not None else np.random
 
         if method == 'uniform':
             inputs = np.column_stack([
-                np.random.uniform(v.low, v.high, n_points)
+                _rng.uniform(v.low, v.high, n_points)
                 for v in self._variables
             ])
         elif method == 'grid':
