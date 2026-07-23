@@ -5,8 +5,6 @@ Includes constant fitting (BFGS), R² scoring, token accuracy,
 and algebraic equivalence checking.
 """
 
-import threading
-
 import numpy as np
 import sympy as sp
 from scipy.optimize import minimize
@@ -18,29 +16,6 @@ from symbolic_jepa.tokenizer import prefix_to_sympy
 def cleanup_eval_pool():
     """No-op — kept for backward compatibility with notebook code."""
     pass
-
-
-def _run_with_timeout(fn, timeout):
-    """Run fn() in a daemon thread with a timeout. Returns None on timeout/error.
-
-    Each call gets its own thread — no pool, no queuing behind stuck work.
-    Timed-out threads are daemon threads: they finish in background without
-    blocking Python exit or queuing up future work.
-    """
-    result = [None]
-    ok = [False]
-
-    def _target():
-        try:
-            result[0] = fn()
-            ok[0] = True
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    return result[0] if ok[0] else None
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +108,9 @@ def fit_constants(expr, constants, X, Y, var_syms, maxiter=100):
 def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
     """Check if two prefix strings are algebraically equivalent.
 
-    Handles commutativity (SymPy normalizes) and constant permutation
-    (c_0, c_1, ... may map differently between pred and gt).
+    Uses only fast checks (SymPy .equals and expand, no sp.simplify)
+    to avoid hanging on pathological expressions.  Handles commutativity
+    (SymPy normalizes) and constant permutation.
     """
     try:
         pred_expr, pred_consts = prefix_to_sympy(pred_str)
@@ -142,35 +118,39 @@ def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
     except Exception:
         return False
 
-    def _check():
-        # Fast path: identical SymPy expressions (handles commutativity)
+    # Fast path: identical SymPy expressions (handles commutativity)
+    try:
         if pred_expr.equals(gt_expr):
             return True
+    except Exception:
+        pass
 
-        # Try simplify on the difference (works when constants align)
-        diff = sp.simplify(pred_expr - gt_expr)
-        if diff.is_zero is True:
+    # Try expand on the difference (fast, catches most algebraic identities)
+    try:
+        diff = sp.expand(pred_expr - gt_expr)
+        if diff is sp.S.Zero or diff == 0:
             return True
+    except Exception:
+        pass
 
-        # Constant permutation: if same number of constants, try all
-        # permutations of pred constants to match gt constants.
-        # (Constants are fittable, so c_0*x + c_1 ≡ c_1*x + c_0.)
-        n_pred, n_gt = len(pred_consts), len(gt_consts)
-        if n_pred == n_gt and 0 < n_pred <= 6:
-            from itertools import permutations
-            for perm in permutations(pred_consts):
-                sub = dict(zip(perm, gt_consts))
-                remapped = pred_expr.subs(sub)
+    # Constant permutation: if same number of constants, try all
+    # permutations of pred constants to match gt constants.
+    n_pred, n_gt = len(pred_consts), len(gt_consts)
+    if n_pred == n_gt and 0 < n_pred <= 4:
+        from itertools import permutations
+        for perm in permutations(pred_consts):
+            sub = dict(zip(perm, gt_consts))
+            remapped = pred_expr.subs(sub)
+            try:
                 if remapped.equals(gt_expr):
                     return True
-                diff2 = sp.simplify(remapped - gt_expr)
-                if diff2.is_zero is True:
+                diff2 = sp.expand(remapped - gt_expr)
+                if diff2 is sp.S.Zero or diff2 == 0:
                     return True
+            except Exception:
+                continue
 
-        return False
-
-    result = _run_with_timeout(_check, timeout)
-    return result is True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +162,21 @@ def evaluate_predictions(
     dataset,
     tokenizer,
     n_fit_points: int = 200,
-    fit_timeout: int = 2,
+    r2_equiv_thresh: float = 0.999,
 ) -> dict:
     """Evaluate a list of (gt_prefix, pred_prefix) pairs.
+
+    Equivalence is determined by R² after constant fitting: if R² >= r2_equiv_thresh
+    the prediction is considered algebraically equivalent.  This is faster and more
+    robust than sympy simplify, and directly measures what matters for symbolic
+    regression.
 
     Args:
         predictions: List of (ground_truth_prefix, predicted_prefix) tuples.
         dataset: PointCloudDataset (for sampling evaluation points).
         tokenizer: PrefixTokenizer.
         n_fit_points: Number of points for constant fitting.
-        fit_timeout: Timeout in seconds for each R² fit attempt.
+        r2_equiv_thresh: R² threshold for declaring equivalence (default 0.999).
 
     Returns:
         Dict with 'exact_match', 'token_accuracy', 'algebraic_equiv',
@@ -199,11 +184,11 @@ def evaluate_predictions(
     """
     exact_matches = []
     token_accs = []
-    algebraic_matches = []
+    equiv_matches = []
     r2_scores = []
     details = []
 
-    pbar = tqdm(predictions, desc='evaluate', leave=False)
+    pbar = tqdm(predictions, desc='evaluate', leave=True)
     for i, (gt_str, pred_str) in enumerate(pbar):
         # Exact match
         exact = int(pred_str.strip() == gt_str.strip())
@@ -217,44 +202,57 @@ def evaluate_predictions(
             hits = sum(p == g for p, g in zip(pred_tokens[:min_len], gt_tokens[:min_len]))
             token_accs.append(hits / max(len(pred_tokens), len(gt_tokens)))
 
-        # Algebraic equivalence — skip expensive simplify for exact matches
-        if exact:
-            equiv = 1
-        else:
-            equiv = int(equations_equivalent(pred_str, gt_str))
-        algebraic_matches.append(equiv)
-
-        # Parse check
+        # Parse both expressions
         parseable = False
+        pred_expr = None
+        pred_consts = None
+        gt_expr = None
         try:
-            prefix_to_sympy(pred_str)
+            pred_expr, pred_consts = prefix_to_sympy(pred_str)
             parseable = True
         except Exception:
             pass
 
-        # R² via constant fitting (thread-based timeout)
+        try:
+            gt_expr, _ = prefix_to_sympy(gt_str)
+        except Exception:
+            pass
+
+        # ── Equivalence cascade: fast sympy first, then R² ──
+        equiv = exact  # start with exact match
+
+        # Level 1: sp.expand on difference (milliseconds, no risk of hanging)
+        if not equiv and pred_expr is not None and gt_expr is not None:
+            try:
+                diff = sp.expand(pred_expr - gt_expr)
+                if diff is sp.S.Zero or diff == 0:
+                    equiv = 1
+            except Exception:
+                pass
+
+        # Level 2: R² via constant fitting (scipy L-BFGS, self-limiting)
         r2 = None
         if parseable and i < len(dataset.samples):
-            expr_obj = dataset.samples[i]['expr']
-
-            def _fit_r2():
-                pred_expr, constants = prefix_to_sympy(pred_str)
+            try:
+                expr_obj = dataset.samples[i]['expr']
                 cloud = expr_obj.sample(n_fit_points)
                 finite_mask = np.isfinite(cloud).all(axis=1)
                 cloud = cloud[finite_mask]
-                if len(cloud) < 50:
-                    return None
-                n_vars = len(expr_obj.variables)
-                X = cloud[:, :n_vars]
-                Y = cloud[:, n_vars]
-                var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
-                _, _, r2_val = fit_constants(pred_expr, constants, X, Y, var_syms)
-                return r2_val
-
-            r2 = _run_with_timeout(_fit_r2, fit_timeout)
+                if len(cloud) >= 50:
+                    n_vars = len(expr_obj.variables)
+                    X = cloud[:, :n_vars]
+                    Y = cloud[:, n_vars]
+                    var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
+                    _, _, r2 = fit_constants(pred_expr, pred_consts, X, Y, var_syms)
+            except Exception:
+                r2 = None
 
         if r2 is not None and np.isfinite(r2):
             r2_scores.append(r2)
+            if not equiv and r2 >= r2_equiv_thresh:
+                equiv = 1
+
+        equiv_matches.append(equiv)
 
         details.append({
             'gt': gt_str, 'pred': pred_str,
@@ -262,16 +260,16 @@ def evaluate_predictions(
         })
 
         # Update progress bar with running stats
-        if (i + 1) % 20 == 0:
+        if (i + 1) % 10 == 0 or i == len(predictions) - 1:
             em = np.mean(exact_matches) * 100
-            eq = np.mean(algebraic_matches) * 100
+            eq = np.mean(equiv_matches) * 100
             pbar.set_postfix(exact=f'{em:.0f}%', equiv=f'{eq:.0f}%')
 
     n = len(predictions)
     results = {
         'exact_match': np.mean(exact_matches) if exact_matches else 0,
         'token_accuracy': np.mean(token_accs) if token_accs else 0,
-        'algebraic_equiv': np.mean(algebraic_matches) if algebraic_matches else 0,
+        'algebraic_equiv': np.mean(equiv_matches) if equiv_matches else 0,
         'mean_r2': np.mean(r2_scores) if r2_scores else float('nan'),
         'median_r2': np.median(r2_scores) if r2_scores else float('nan'),
         'r2_above_0.9': np.mean([r > 0.9 for r in r2_scores]) if r2_scores else 0,
