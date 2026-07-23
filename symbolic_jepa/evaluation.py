@@ -157,6 +157,9 @@ def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
 # Full evaluation pipeline
 # ---------------------------------------------------------------------------
 
+_R2_EVAL_SEED = 777_777_773  # deterministic seed for R² eval clouds
+
+
 def evaluate_predictions(
     predictions: list[tuple[str, str]],
     dataset,
@@ -170,6 +173,9 @@ def evaluate_predictions(
     the prediction is considered algebraically equivalent.  This is faster and more
     robust than sympy simplify, and directly measures what matters for symbolic
     regression.
+
+    R² evaluation uses deterministic point clouds (seeded by sample index)
+    so results are reproducible across runs.
 
     Args:
         predictions: List of (ground_truth_prefix, predicted_prefix) tuples.
@@ -185,7 +191,7 @@ def evaluate_predictions(
     exact_matches = []
     token_accs = []
     equiv_matches = []
-    r2_scores = []
+    r2_all = []  # one entry per prediction (None if not computable)
     details = []
 
     pbar = tqdm(predictions, desc='evaluate', leave=True)
@@ -231,11 +237,13 @@ def evaluate_predictions(
                 pass
 
         # Level 2: R² via constant fitting (scipy L-BFGS, self-limiting)
+        # Uses a deterministic RNG seeded per-sample for reproducibility.
         r2 = None
         if parseable and i < len(dataset.samples):
             try:
                 expr_obj = dataset.samples[i]['expr']
-                cloud = expr_obj.sample(n_fit_points)
+                rng = np.random.RandomState(_R2_EVAL_SEED + i)
+                cloud = expr_obj.sample(n_fit_points, rng=rng)
                 finite_mask = np.isfinite(cloud).all(axis=1)
                 cloud = cloud[finite_mask]
                 if len(cloud) >= 50:
@@ -247,8 +255,9 @@ def evaluate_predictions(
             except Exception:
                 r2 = None
 
+        r2_all.append(r2)
+
         if r2 is not None and np.isfinite(r2):
-            r2_scores.append(r2)
             if not equiv and r2 >= r2_equiv_thresh:
                 equiv = 1
 
@@ -266,13 +275,15 @@ def evaluate_predictions(
             pbar.set_postfix(exact=f'{em:.0f}%', equiv=f'{eq:.0f}%')
 
     n = len(predictions)
+    finite_r2 = [r for r in r2_all if r is not None and np.isfinite(r)]
     results = {
         'exact_match': np.mean(exact_matches) if exact_matches else 0,
         'token_accuracy': np.mean(token_accs) if token_accs else 0,
         'algebraic_equiv': np.mean(equiv_matches) if equiv_matches else 0,
-        'mean_r2': np.mean(r2_scores) if r2_scores else float('nan'),
-        'median_r2': np.median(r2_scores) if r2_scores else float('nan'),
-        'r2_above_0.9': np.mean([r > 0.9 for r in r2_scores]) if r2_scores else 0,
+        'mean_r2': np.mean(finite_r2) if finite_r2 else float('nan'),
+        'median_r2': np.median(finite_r2) if finite_r2 else float('nan'),
+        # R²>0.9 out of ALL predictions (not just parseable)
+        'r2_above_0.9': sum(1 for r in r2_all if r is not None and r > 0.9) / max(n, 1),
         'n_parseable': sum(1 for d in details if d['parseable']),
         'n_total': n,
         'details': details,
