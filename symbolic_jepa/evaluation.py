@@ -5,7 +5,6 @@ Includes constant fitting (BFGS), R² scoring, token accuracy,
 and algebraic equivalence checking.
 """
 
-import signal
 import threading
 
 import numpy as np
@@ -17,44 +16,17 @@ from symbolic_jepa.tokenizer import prefix_to_sympy
 
 
 def cleanup_eval_pool():
-    """No-op — kept for backward compatibility with notebook code.
-
-    Signal-based timeouts don't use a pool, so nothing to clean up.
-    """
+    """No-op — kept for backward compatibility with notebook code."""
     pass
 
 
 def _run_with_timeout(fn, timeout):
-    """Run fn() with a hard timeout. Returns None on timeout/error.
+    """Run fn() in a daemon thread with a timeout. Returns None on timeout/error.
 
-    On Unix main thread: uses SIGALRM to actually interrupt stuck work
-    (sympy simplify, BFGS fitting, etc.). No zombie threads.
-    Fallback: daemon thread (stuck work may linger briefly).
+    Each call gets its own thread — no pool, no queuing behind stuck work.
+    Timed-out threads are daemon threads: they finish in background without
+    blocking Python exit or queuing up future work.
     """
-    if (hasattr(signal, 'SIGALRM')
-            and threading.current_thread() is threading.main_thread()):
-        return _signal_timeout(fn, timeout)
-    return _thread_timeout(fn, timeout)
-
-
-def _signal_timeout(fn, timeout):
-    """SIGALRM-based timeout — actually kills stuck work."""
-    def _handler(signum, frame):
-        raise TimeoutError()
-
-    old = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(timeout)
-    try:
-        return fn()
-    except (TimeoutError, Exception):
-        return None
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
-
-
-def _thread_timeout(fn, timeout):
-    """Thread-based timeout fallback (non-Unix / non-main-thread)."""
     result = [None]
     ok = [False]
 
