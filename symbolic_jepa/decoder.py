@@ -70,12 +70,11 @@ class SymbolicTransformer(nn.Module):
         pred_logits = logits[:, 1:-1, :]      # (batch, seq-1, vocab)
         targets = input_ids[:, 1:]             # (batch, seq-1)
 
-        loss = F.cross_entropy(
-            pred_logits.reshape(-1, pred_logits.size(-1)),
-            targets.reshape(-1),
-            ignore_index=self.pad_id,
-        )
-        return {'loss': loss, 'logits': logits, 'z_num': z_num}
+        flat_logits = pred_logits.reshape(-1, pred_logits.size(-1))
+        flat_targets = targets.reshape(-1)
+        loss = F.cross_entropy(flat_logits, flat_targets, ignore_index=self.pad_id)
+        n_valid = (flat_targets != self.pad_id).sum().item()
+        return {'loss': loss, 'logits': logits, 'z_num': z_num, 'n_tokens': n_valid}
 
     def encode_expression(self, input_ids, attn_mask=None):
         """Encode equation tokens without data token -> last-token-pooled z_sym.

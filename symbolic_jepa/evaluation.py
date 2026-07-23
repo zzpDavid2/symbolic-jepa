@@ -39,14 +39,22 @@ def teacher_forced_accuracy(logits, targets, pad_id: int) -> float:
         targets: (batch, seq) — ground-truth token IDs.
         pad_id: Token ID used for padding.
     """
-    # logits[:, 1:-1, :] → predictions from <sos> onward (skipping data-token)
-    # targets[:, 1:]     → ground-truth after <sos>
+    correct, total = teacher_forced_counts(logits, targets, pad_id)
+    return correct / (total + 1e-10)
+
+
+def teacher_forced_counts(logits, targets, pad_id: int) -> tuple[float, float]:
+    """Return (n_correct, n_total) for token-level accuracy.
+
+    Same logic as teacher_forced_accuracy but returns raw counts
+    for proper aggregation across batches of different lengths.
+    """
     pred = logits[:, 1:-1, :].argmax(dim=-1)   # (batch, seq-1)
     tgt = targets[:, 1:]                        # (batch, seq-1)
     mask = (tgt != pad_id)
-    correct = ((pred == tgt) & mask).float().sum()
-    total = mask.float().sum()
-    return (correct / (total + 1e-10)).item()
+    correct = ((pred == tgt) & mask).float().sum().item()
+    total = mask.float().sum().item()
+    return correct, total
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +165,10 @@ def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
 # Full evaluation pipeline
 # ---------------------------------------------------------------------------
 
-_R2_EVAL_SEED = 777_777_773  # deterministic seed for R² eval clouds
+# Deterministic seeds for R² evaluation, independent of model seed.
+# Two separate seeds so fit and eval clouds are independent.
+_R2_FIT_SEED  = 777_777_773
+_R2_EVAL_SEED = 555_555_557
 
 
 def evaluate_predictions(
@@ -165,23 +176,22 @@ def evaluate_predictions(
     dataset,
     tokenizer,
     n_fit_points: int = 200,
+    n_eval_points: int = 200,
     r2_equiv_thresh: float = 0.999,
 ) -> dict:
     """Evaluate a list of (gt_prefix, pred_prefix) pairs.
 
-    Equivalence is determined by R² after constant fitting: if R² >= r2_equiv_thresh
-    the prediction is considered algebraically equivalent.  This is faster and more
-    robust than sympy simplify, and directly measures what matters for symbolic
-    regression.
-
-    R² evaluation uses deterministic point clouds (seeded by sample index)
-    so results are reproducible across runs.
+    Equivalence is determined by held-out R² after constant fitting:
+    constants are fitted on one deterministic point cloud, then R² is
+    computed on a separate held-out cloud.  Both are seeded per-sample
+    for reproducibility.
 
     Args:
         predictions: List of (ground_truth_prefix, predicted_prefix) tuples.
         dataset: PointCloudDataset (for sampling evaluation points).
         tokenizer: PrefixTokenizer.
         n_fit_points: Number of points for constant fitting.
+        n_eval_points: Number of held-out points for R² evaluation.
         r2_equiv_thresh: R² threshold for declaring equivalence (default 0.999).
 
     Returns:
@@ -236,22 +246,51 @@ def evaluate_predictions(
             except Exception:
                 pass
 
-        # Level 2: R² via constant fitting (scipy L-BFGS, self-limiting)
-        # Uses a deterministic RNG seeded per-sample for reproducibility.
+        # Level 2: R² via constant fitting on fit cloud, evaluated on held-out cloud.
+        # Uses deterministic RNGs seeded per-sample for reproducibility.
         r2 = None
         if parseable and i < len(dataset.samples):
             try:
                 expr_obj = dataset.samples[i]['expr']
-                rng = np.random.RandomState(_R2_EVAL_SEED + i)
-                cloud = expr_obj.sample(n_fit_points, rng=rng)
-                finite_mask = np.isfinite(cloud).all(axis=1)
-                cloud = cloud[finite_mask]
-                if len(cloud) >= 50:
-                    n_vars = len(expr_obj.variables)
-                    X = cloud[:, :n_vars]
-                    Y = cloud[:, n_vars]
-                    var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
-                    _, _, r2 = fit_constants(pred_expr, pred_consts, X, Y, var_syms)
+                n_vars = len(expr_obj.variables)
+                var_syms = [sp.Symbol(f'x{j+1}') for j in range(n_vars)]
+
+                # Fit cloud: fit constants
+                fit_rng = np.random.RandomState(_R2_FIT_SEED + i)
+                fit_cloud = expr_obj.sample(n_fit_points, rng=fit_rng)
+                fit_mask = np.isfinite(fit_cloud).all(axis=1)
+                fit_cloud = fit_cloud[fit_mask]
+
+                if len(fit_cloud) >= 50:
+                    X_fit = fit_cloud[:, :n_vars]
+                    Y_fit = fit_cloud[:, n_vars]
+                    fitted_dict, _, _ = fit_constants(
+                        pred_expr, pred_consts, X_fit, Y_fit, var_syms,
+                    )
+
+                    if fitted_dict is not None:
+                        # Substitute fitted constants into expression
+                        subs = {c: fitted_dict[str(c)] for c in pred_consts
+                                if str(c) in fitted_dict}
+                        fitted_expr = pred_expr.subs(subs) if subs else pred_expr
+                        f_eval = sp.lambdify(var_syms, fitted_expr, 'numpy')
+
+                        # Eval cloud: compute held-out R²
+                        eval_rng = np.random.RandomState(_R2_EVAL_SEED + i)
+                        eval_cloud = expr_obj.sample(n_eval_points, rng=eval_rng)
+                        eval_mask = np.isfinite(eval_cloud).all(axis=1)
+                        eval_cloud = eval_cloud[eval_mask]
+
+                        if len(eval_cloud) >= 50:
+                            X_eval = eval_cloud[:, :n_vars]
+                            Y_eval = eval_cloud[:, n_vars]
+                            with np.errstate(all='ignore'):
+                                Y_pred = np.broadcast_to(
+                                    np.asarray(f_eval(*X_eval.T), dtype=float),
+                                    Y_eval.shape,
+                                ).copy()
+                            if np.all(np.isfinite(Y_pred)):
+                                r2 = r2_score(Y_eval, Y_pred)
             except Exception:
                 r2 = None
 
