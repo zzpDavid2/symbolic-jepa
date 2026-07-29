@@ -5,6 +5,8 @@ Wraps Expression objects into point-cloud + token-sequence pairs.
 Each __getitem__ resamples the point cloud for data augmentation.
 """
 
+import hashlib
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -14,6 +16,71 @@ from symbolic_jepa.tokenizer import PrefixTokenizer
 
 # Fixed seed for deterministic eval point clouds, independent of model seed.
 _EVAL_DATA_SEED = 999_999_937
+
+
+def sample_and_normalize(
+    expr: Expression,
+    n_points: int,
+    target_d: int,
+    rng: np.random.RandomState | None = None,
+    random_subsample: bool = True,
+) -> torch.Tensor:
+    """Sample a point cloud from *expr*, then filter, resize, normalize, pad.
+
+    Args:
+        expr: Expression to sample from.
+        n_points: Target number of points.
+        target_d: Target feature width (max_vars + 1).
+        rng: RandomState for reproducible sampling, or None for the global
+            numpy RNG.
+        random_subsample: When more finite points survive than n_points,
+            take a random subset (True) or the first n_points (False).
+
+    Returns:
+        (n_points, target_d) float32 tensor.
+
+    Raises:
+        RuntimeError: If fewer than 10 finite points survive filtering.
+    """
+    cloud = expr.sample(n_points, method='uniform', rng=rng)
+
+    # Filter non-finite rows
+    finite_mask = np.isfinite(cloud).all(axis=1)
+    cloud = cloud[finite_mask]
+
+    if len(cloud) < 10:
+        raise RuntimeError(
+            f"Expression {expr!r} produced fewer than 10 finite points "
+            f"({len(cloud)} of {n_points}). Cannot build a valid "
+            f"point cloud — this expression should be dropped."
+        )
+
+    src_rng = rng if rng is not None else np.random
+
+    # Pad or truncate to n_points
+    if len(cloud) >= n_points:
+        if random_subsample:
+            choice_idx = src_rng.choice(len(cloud), n_points, replace=False)
+            cloud = cloud[choice_idx]
+        else:
+            cloud = cloud[:n_points]
+    else:
+        # Repeat existing points to fill to n_points
+        n_need = n_points - len(cloud)
+        extra_idx = src_rng.choice(len(cloud), n_need, replace=True)
+        cloud = np.vstack([cloud, cloud[extra_idx]])
+
+    # Normalize per-column
+    cloud = (cloud - cloud.mean(axis=0)) / (cloud.std(axis=0) + 1e-8)
+
+    # Pad dimensions to target_d
+    _, d = cloud.shape
+    if d < target_d:
+        cloud = np.pad(cloud, ((0, 0), (0, target_d - d)))
+    else:
+        cloud = cloud[:, :target_d]
+
+    return torch.tensor(cloud, dtype=torch.float32)
 
 
 class PointCloudDataset(Dataset):
@@ -110,44 +177,81 @@ class PointCloudDataset(Dataset):
         else:
             rng = None  # use global numpy RNG (stochastic)
 
-        cloud = expr.sample(self.n_points, method='uniform', rng=rng)
+        return sample_and_normalize(
+            expr, self.n_points, self.target_d,
+            rng=rng, random_subsample=self.resample,
+        )
 
-        # Filter non-finite rows
-        finite_mask = np.isfinite(cloud).all(axis=1)
-        cloud = cloud[finite_mask]
 
-        if len(cloud) < 10:
-            raise RuntimeError(
-                f"Expression {expr!r} produced fewer than 10 finite points "
-                f"({len(cloud)} of {self.n_points}). Cannot build a valid "
-                f"point cloud — this expression should be dropped."
+class MultiViewPointCloudDataset(PointCloudDataset):
+    """Dataset returning *n_views* independently sampled clouds per equation.
+
+    Used for subsample-JEPA: the encoder should map different numerical
+    observations of the same function to similar latents.
+
+    View seeds derive deterministically from
+    ``(train_view_seed, epoch, idx, view_idx)``, so:
+
+    * the same expression gets fresh views every epoch;
+    * runs that share data seeds but differ in lambda see identical views;
+    * DataLoader worker assignment does not affect the generated views.
+
+    .. warning::
+       ``self.epoch`` is read inside ``__getitem__``.  Build the training
+       DataLoader with ``persistent_workers=False`` — persistent workers hold
+       a forked copy of this object and would never observe epoch updates
+       made in the parent process, silently freezing the views.
+    """
+
+    def __init__(
+        self,
+        expressions: list[Expression],
+        tokenizer: PrefixTokenizer,
+        n_points: int = 1000,
+        max_seq_len: int = 64,
+        max_vars: int = 9,
+        n_views: int = 2,
+        train_view_seed: int = 1729,
+    ):
+        super().__init__(
+            expressions, tokenizer,
+            n_points=n_points, max_seq_len=max_seq_len,
+            max_vars=max_vars, resample=True,
+        )
+        self.n_views = n_views
+        self.train_view_seed = train_view_seed
+        self.epoch = 0  # set by the training loop before each epoch
+
+    @staticmethod
+    def view_seed(train_view_seed: int, epoch: int, idx: int, view_idx: int) -> int:
+        """Deterministic 32-bit seed for one (epoch, expression, view) triple.
+
+        Uses SHA-256 rather than Python's ``hash()``, which is randomized
+        per process for strings and would break reproducibility.
+        """
+        key = f'{train_view_seed}|{epoch}|{idx}|{view_idx}'.encode()
+        return int.from_bytes(hashlib.sha256(key).digest()[:4], 'big')
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        views = [
+            sample_and_normalize(
+                s['expr'], self.n_points, self.target_d,
+                rng=np.random.RandomState(
+                    self.view_seed(self.train_view_seed, self.epoch, idx, v)
+                ),
+                random_subsample=True,
             )
-
-        # Pad or truncate to n_points
-        if len(cloud) >= self.n_points:
-            if self.resample:
-                choice_idx = np.random.choice(len(cloud), self.n_points, replace=False)
-                cloud = cloud[choice_idx]
-            else:
-                cloud = cloud[:self.n_points]
-        else:
-            # Repeat existing points to fill to n_points
-            n_need = self.n_points - len(cloud)
-            src_rng = rng if rng is not None else np.random
-            extra_idx = src_rng.choice(len(cloud), n_need, replace=True)
-            cloud = np.vstack([cloud, cloud[extra_idx]])
-
-        # Normalize per-column
-        cloud = (cloud - cloud.mean(axis=0)) / (cloud.std(axis=0) + 1e-8)
-
-        # Pad dimensions to target_d
-        _, d = cloud.shape
-        if d < self.target_d:
-            cloud = np.pad(cloud, ((0, 0), (0, self.target_d - d)))
-        else:
-            cloud = cloud[:, :self.target_d]
-
-        return torch.tensor(cloud, dtype=torch.float32)
+            for v in range(self.n_views)
+        ]
+        return {
+            # (n_views, n_points, target_d)
+            'points_views': torch.stack(views),
+            # view 0 under the standard key, so single-view code still works
+            'points': views[0],
+            'input_ids': s['input_ids'],
+            'attn_mask': s['attn_mask'],
+        }
 
 
 def build_feynman_splits(
@@ -232,3 +336,61 @@ def build_synthetic_splits(
         print(f'Synthetic {name}: {len(datasets[name])} equations')
 
     return datasets['train'], datasets['val'], datasets['test']
+
+
+def _split_indices(
+    n: int, seed: int, train_frac: float, val_frac: float,
+) -> dict[str, np.ndarray]:
+    """Shuffle 0..n-1 and cut into train/val/test index arrays."""
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_train = int(train_frac * n)
+    n_val = int(val_frac * n)
+    return {
+        'train': idx[:n_train],
+        'val': idx[n_train:n_train + n_val],
+        'test': idx[n_train + n_val:],
+    }
+
+
+def build_multiview_synthetic_splits(
+    expressions: list[Expression],
+    tokenizer: PrefixTokenizer,
+    n_points: int = 1000,
+    max_seq_len: int = 64,
+    max_vars: int = 9,
+    seed: int = 42,
+    train_frac: float = 0.8,
+    val_frac: float = 0.1,
+    n_views: int = 2,
+    train_view_seed: int = 1729,
+) -> tuple[MultiViewPointCloudDataset, PointCloudDataset, PointCloudDataset]:
+    """Split synthetic expressions, with a multi-view training set.
+
+    Uses the same shuffle as build_synthetic_splits, so for a given *seed*
+    the train/val/test partition matches the single-view sweep exactly and
+    results stay comparable.  Val and test remain deterministic single-view.
+
+    Returns:
+        (train_ds, val_ds, test_ds)
+    """
+    splits = _split_indices(len(expressions), seed, train_frac, val_frac)
+
+    train_ds = MultiViewPointCloudDataset(
+        [expressions[i] for i in splits['train']], tokenizer,
+        n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
+        n_views=n_views, train_view_seed=train_view_seed,
+    )
+    print(f'Synthetic train: {len(train_ds)} equations ({n_views} views each)')
+
+    eval_ds = {}
+    for name in ('val', 'test'):
+        eval_ds[name] = PointCloudDataset(
+            [expressions[i] for i in splits[name]], tokenizer,
+            n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
+            resample=False,
+        )
+        print(f'Synthetic {name}: {len(eval_ds[name])} equations')
+
+    return train_ds, eval_ds['val'], eval_ds['test']
