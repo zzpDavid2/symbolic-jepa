@@ -315,8 +315,15 @@ def build_synthetic_splits(
     seed: int = 42,
     train_frac: float = 0.8,
     val_frac: float = 0.1,
+    cache_eval: bool = False,
 ) -> tuple[PointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Split synthetic expressions into train/val/test datasets.
+
+    Args:
+        cache_eval: cache the val/test clouds.  They are deterministic, so
+            re-deriving them every epoch is wasted work; caching lets an eval
+            loader run with num_workers=0 at no cost.  Off by default so
+            existing callers are unaffected.
 
     Returns:
         (train_ds, val_ds, test_ds)
@@ -344,6 +351,7 @@ def build_synthetic_splits(
             max_seq_len=max_seq_len,
             max_vars=max_vars,
             resample=(name == 'train'),
+            cache=(cache_eval and name != 'train'),
         )
         print(f'Synthetic {name}: {len(datasets[name])} equations')
 
