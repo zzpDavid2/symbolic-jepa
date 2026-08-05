@@ -99,6 +99,7 @@ class PointCloudDataset(Dataset):
         max_seq_len: int = 64,
         max_vars: int = 9,
         resample: bool = True,
+        cache: bool = False,
     ):
         self.tokenizer = tokenizer
         self.n_points = n_points
@@ -106,6 +107,11 @@ class PointCloudDataset(Dataset):
         self.max_vars = max_vars
         self.target_d = max_vars + 1  # input vars + output
         self.resample = resample
+        # Only meaningful when resample=False: those clouds are deterministic,
+        # so re-deriving them every epoch is pure waste.  Caching lets an
+        # eval loader run with num_workers=0 without paying for it.
+        self.cache = cache and not resample
+        self._cloud_cache: dict[int, torch.Tensor] = {}
 
         # Pre-tokenize and filter
         self.samples: list[dict] = []
@@ -172,15 +178,21 @@ class PointCloudDataset(Dataset):
         _EVAL_DATA_SEED + idx so repeated access gives the same cloud and
         the model training seed has no effect.
         """
+        if self.cache and idx in self._cloud_cache:
+            return self._cloud_cache[idx]
+
         if not self.resample:
             rng = np.random.RandomState(_EVAL_DATA_SEED + idx)
         else:
             rng = None  # use global numpy RNG (stochastic)
 
-        return sample_and_normalize(
+        cloud = sample_and_normalize(
             expr, self.n_points, self.target_d,
             rng=rng, random_subsample=self.resample,
         )
+        if self.cache:
+            self._cloud_cache[idx] = cloud
+        return cloud
 
 
 class MultiViewPointCloudDataset(PointCloudDataset):
@@ -389,7 +401,7 @@ def build_multiview_synthetic_splits(
         eval_ds[name] = PointCloudDataset(
             [expressions[i] for i in splits[name]], tokenizer,
             n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
-            resample=False,
+            resample=False, cache=True,
         )
         print(f'Synthetic {name}: {len(eval_ds[name])} equations')
 
