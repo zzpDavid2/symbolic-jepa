@@ -149,6 +149,53 @@ class TestEpochPropagation:
         )
 
 
+class TestEvalCloudCache:
+    """Caching deterministic eval clouds must be value-neutral."""
+
+    def test_cached_matches_uncached(self, exprs, tok):
+        kw = dict(n_points=100, max_vars=1, resample=False)
+        plain = PointCloudDataset(exprs, tok, **kw)
+        cached = PointCloudDataset(exprs, tok, cache=True, **kw)
+        for i in range(len(plain)):
+            assert torch.equal(plain[i]['points'], cached[i]['points']), (
+                f'cache changed the cloud for sample {i}'
+            )
+
+    def test_cache_returns_stable_values(self, exprs, tok):
+        ds = PointCloudDataset(exprs, tok, n_points=100, max_vars=1,
+                               resample=False, cache=True)
+        first = ds[0]['points'].clone()
+        np.random.seed(999)          # perturb global RNG
+        assert torch.equal(ds[0]['points'], first)
+
+    def test_cache_populates(self, exprs, tok):
+        ds = PointCloudDataset(exprs, tok, n_points=100, max_vars=1,
+                               resample=False, cache=True)
+        assert len(ds._cloud_cache) == 0
+        ds[0]; ds[1]
+        assert len(ds._cloud_cache) == 2
+
+    def test_cache_ignored_when_resampling(self, exprs, tok):
+        """Train clouds must stay fresh; caching them would be a bug."""
+        ds = PointCloudDataset(exprs, tok, n_points=100, max_vars=1,
+                               resample=True, cache=True)
+        assert ds.cache is False
+        ds[0]
+        assert len(ds._cloud_cache) == 0
+
+    def test_default_is_uncached(self, exprs, tok):
+        """jepa_sweep builds datasets without `cache`; behaviour must not shift."""
+        ds = PointCloudDataset(exprs, tok, n_points=100, max_vars=1,
+                               resample=False)
+        assert ds.cache is False
+
+    def test_multiview_splits_cache_eval_only(self, exprs, tok):
+        train, val, test = build_multiview_synthetic_splits(
+            exprs * 4, tok, n_points=100, max_vars=1, seed=42, n_views=2)
+        assert train.cache is False, 'training views must not be cached'
+        assert val.cache is True and test.cache is True
+
+
 class TestSplitParity:
     def test_same_partition_as_single_view(self, exprs, tok):
         """Multi-view splits must match the single-view sweep's partition."""

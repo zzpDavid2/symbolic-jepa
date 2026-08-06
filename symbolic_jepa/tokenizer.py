@@ -114,11 +114,27 @@ def sympy_to_prefix(expr, var_map: dict[str, str]) -> Optional[str]:
 # Prefix -> SymPy
 # ============================================================================
 
-def prefix_to_sympy(tokens):
+def prefix_to_sympy(tokens, strict: bool = True):
     """Parse a prefix string (or token list) into a SymPy expression.
 
-    Returns (expr, constants) where constants is a list of sp.Symbol
-    objects named c_0, c_1, ... representing fittable constants.
+    Args:
+        tokens: prefix string or list of tokens.
+        strict: reject input whose tokens are not fully consumed by one
+            expression.  Prefix notation is self-delimiting, so
+            ``add x1 C mul x1 C`` contains a complete expression
+            (``add x1 C``) followed by garbage.  Parsing only the prefix
+            makes a malformed prediction look algebraically correct while
+            exact-match — which sees the whole string — fails, producing the
+            contradictory "equiv=True, exact=False" pattern.  Pass
+            ``strict=False`` only if partial parsing is genuinely wanted.
+
+    Returns:
+        (expr, constants) where constants is a list of sp.Symbol objects
+        named c_0, c_1, ... representing fittable constants.
+
+    Raises:
+        ValueError: on unknown/truncated tokens, or (when strict) on tokens
+            trailing a complete expression.
     """
     if isinstance(tokens, str):
         tokens = tokens.split()
@@ -151,7 +167,12 @@ def prefix_to_sympy(tokens):
 
         raise ValueError(f'Unknown token: {tok}')
 
-    expr, _ = _parse(0)
+    expr, end_idx = _parse(0)
+    if strict and end_idx != len(tokens):
+        raise ValueError(
+            f'Trailing tokens after complete prefix expression: '
+            f'{tokens[end_idx:]}'
+        )
     return expr, constants
 
 
@@ -206,10 +227,22 @@ class PrefixTokenizer:
         return ids
 
     def decode(self, ids, skip_special: bool = True) -> str:
-        """Decode token IDs back to a space-separated string."""
-        tokens = [self.id2token.get(int(i), '<unk>') for i in ids]
-        if skip_special:
-            tokens = [t for t in tokens if t not in ('<pad>', '<sos>', '<eos>')]
+        """Decode token IDs back to a space-separated string.
+
+        Reading STOPS at the first ``<eos>``: it terminates the sequence, so
+        anything after it is not part of the prediction.  Filtering ``<eos>``
+        out of the list instead (the old behaviour) silently spliced post-EOS
+        padding text onto an otherwise correct prediction, e.g.
+        ``<sos> add x1 C <eos> mul x1 C`` -> ``add x1 C mul x1 C``.
+        """
+        tokens = []
+        for i in ids:
+            tok = self.id2token.get(int(i), '<unk>')
+            if tok == '<eos>':
+                break
+            if skip_special and tok in ('<pad>', '<sos>'):
+                continue
+            tokens.append(tok)
         return ' '.join(tokens)
 
     def extend(self, new_tokens: list[str]):

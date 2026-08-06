@@ -122,9 +122,21 @@ class SymbolicTransformer(nn.Module):
 
         for _ in range(max_new_tokens):
             out = self.forward(points, ids)
-            next_tok = out['logits'][:, -1, :].argmax(dim=-1, keepdim=True)
-            finished = finished | (next_tok.squeeze(-1) == tokenizer.eos_id)
-            ids = torch.cat([ids, next_tok], dim=1)
+            next_tok = out['logits'][:, -1, :].argmax(dim=-1)   # (batch,)
+
+            # Freeze finished rows. Batched greedy keeps stepping until EVERY
+            # row has emitted <eos>, so without this a row that finished early
+            # keeps appending real tokens while it waits:
+            #     <sos> add x1 C <eos> mul x1 C ...
+            # That post-EOS text is meaningless but still ends up in the
+            # decoded string, which wrecks exact-match scoring.
+            next_tok = torch.where(
+                finished,
+                torch.full_like(next_tok, tokenizer.eos_id),
+                next_tok,
+            )
+            finished = finished | next_tok.eq(tokenizer.eos_id)
+            ids = torch.cat([ids, next_tok.unsqueeze(1)], dim=1)
             if finished.all():
                 break
 

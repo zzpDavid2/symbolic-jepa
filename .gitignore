@@ -2,6 +2,7 @@
 data/*
 runs/*
 checkpoints/*
+tasks/*
 
 # MacOS
 .DS_Store
@@ -224,3 +225,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Corrupt object store kept after the 2026-08-07 packfile repair; safe to delete.
+.git.corrupt/
