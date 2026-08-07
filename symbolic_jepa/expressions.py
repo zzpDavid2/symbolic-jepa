@@ -392,6 +392,8 @@ def load_synthetic_pkl(
     max_seq_len: int = 64,
     tokenizer: Optional[PrefixTokenizer] = None,
     max_expressions: int = 0,
+    dedupe_by_tokens: bool = True,
+    max_per_sequence: int = 1,
 ) -> list[Expression]:
     """Load synthetic expressions from a pickle file.
 
@@ -403,6 +405,9 @@ def load_synthetic_pkl(
         max_seq_len: Drop expressions whose prefix tokenization exceeds this.
         tokenizer: PrefixTokenizer instance (created if None).
         max_expressions: Max number of expressions to load (0 = all).
+        dedupe_by_tokens: Keep at most *max_per_sequence* expressions per
+            distinct prefix token sequence.
+        max_per_sequence: Copies to keep per distinct token sequence.
 
     Returns:
         List of Expression objects ready for dataset construction.
@@ -423,6 +428,8 @@ def load_synthetic_pkl(
     n_tokenize = 0
     n_too_long = 0
     n_unk = 0
+    n_dup = 0
+    seq_counts: dict[tuple, int] = {}
     first_errors: list[str] = []
 
     for expr_str in expr_strings:
@@ -452,7 +459,19 @@ def load_synthetic_pkl(
                 first_errors.append(f"unk tokens: {unk_toks}")
             continue
 
+        if dedupe_by_tokens:
+            key = tuple(ids)
+            if seq_counts.get(key, 0) >= max_per_sequence:
+                n_dup += 1
+                continue
+            seq_counts[key] = seq_counts.get(key, 0) + 1
+
         results.append(expr)
+
+    if dedupe_by_tokens:
+        print(f"load_synthetic_pkl: {len(expr_strings)} strings -> "
+              f"{len(results)} kept, {len(seq_counts)} distinct token sequences "
+              f"({n_dup} duplicate-sequence expressions dropped)")
 
     n_failed = n_parse + n_tokenize + n_too_long + n_unk
     if n_failed > 0:

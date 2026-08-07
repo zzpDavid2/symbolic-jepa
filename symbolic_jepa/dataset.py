@@ -18,44 +18,76 @@ from symbolic_jepa.tokenizer import PrefixTokenizer
 _EVAL_DATA_SEED = 999_999_937
 
 
-def sample_and_normalize(
+def sample_pool(
     expr: Expression,
+    n_points: int,
+    rng: np.random.RandomState | None = None,
+    min_finite: int = 10,
+    n_tries: int = 3,
+) -> np.ndarray:
+    """Sample *n_points* from *expr* and keep the finite rows.
+
+    Args:
+        expr: Expression to sample from.
+        n_points: Number of points to draw, before finite filtering.
+        rng: RandomState for reproducible sampling, or None for the global
+            numpy RNG.
+        min_finite: Minimum finite rows required.
+        n_tries: Redraws allowed before giving up.
+
+    Returns:
+        (n_finite, n_vars + 1) array with n_finite >= min_finite.
+
+    Raises:
+        RuntimeError: If fewer than *min_finite* finite points survive
+            filtering on every attempt.
+    """
+    src_rng = rng if rng is not None else np.random
+    cloud = np.empty((0, 0))
+
+    for attempt in range(n_tries):
+        draw_rng = src_rng if attempt == 0 else np.random.RandomState(
+            int(src_rng.randint(0, 2 ** 31 - 1))
+        )
+        cloud = expr.sample(n_points, method='uniform', rng=draw_rng)
+
+        # Filter non-finite rows
+        finite_mask = np.isfinite(cloud).all(axis=1)
+        cloud = cloud[finite_mask]
+
+        if len(cloud) >= min_finite:
+            return cloud
+
+    raise RuntimeError(
+        f"Expression {expr!r} produced fewer than {min_finite} finite points "
+        f"({len(cloud)} of {n_points}) on {n_tries} attempts. Cannot build a "
+        f"valid point cloud — this expression should be dropped."
+    )
+
+
+def subsample_and_normalize(
+    pool: np.ndarray,
     n_points: int,
     target_d: int,
     rng: np.random.RandomState | None = None,
     random_subsample: bool = True,
 ) -> torch.Tensor:
-    """Sample a point cloud from *expr*, then filter, resize, normalize, pad.
+    """Take *n_points* rows out of *pool*, then normalize and pad.
 
     Args:
-        expr: Expression to sample from.
+        pool: (n_finite, n_vars + 1) array from sample_pool.
         n_points: Target number of points.
         target_d: Target feature width (max_vars + 1).
-        rng: RandomState for reproducible sampling, or None for the global
+        rng: RandomState for reproducible subsampling, or None for the global
             numpy RNG.
-        random_subsample: When more finite points survive than n_points,
+        random_subsample: When the pool holds more points than n_points,
             take a random subset (True) or the first n_points (False).
 
     Returns:
         (n_points, target_d) float32 tensor.
-
-    Raises:
-        RuntimeError: If fewer than 10 finite points survive filtering.
     """
-    cloud = expr.sample(n_points, method='uniform', rng=rng)
-
-    # Filter non-finite rows
-    finite_mask = np.isfinite(cloud).all(axis=1)
-    cloud = cloud[finite_mask]
-
-    if len(cloud) < 10:
-        raise RuntimeError(
-            f"Expression {expr!r} produced fewer than 10 finite points "
-            f"({len(cloud)} of {n_points}). Cannot build a valid "
-            f"point cloud — this expression should be dropped."
-        )
-
     src_rng = rng if rng is not None else np.random
+    cloud = pool
 
     # Pad or truncate to n_points
     if len(cloud) >= n_points:
@@ -81,6 +113,39 @@ def sample_and_normalize(
         cloud = cloud[:, :target_d]
 
     return torch.tensor(cloud, dtype=torch.float32)
+
+
+def sample_and_normalize(
+    expr: Expression,
+    n_points: int,
+    target_d: int,
+    rng: np.random.RandomState | None = None,
+    random_subsample: bool = True,
+    pool_mult: int = 1,
+) -> torch.Tensor:
+    """Sample a point cloud from *expr*, then filter, resize, normalize, pad.
+
+    Args:
+        expr: Expression to sample from.
+        n_points: Target number of points.
+        target_d: Target feature width (max_vars + 1).
+        rng: RandomState for reproducible sampling, or None for the global
+            numpy RNG.
+        random_subsample: When more finite points survive than n_points,
+            take a random subset (True) or the first n_points (False).
+        pool_mult: Draw n_points * pool_mult candidates before subsampling.
+            At pool_mult=1 the subsample is only a permutation.
+
+    Returns:
+        (n_points, target_d) float32 tensor.
+
+    Raises:
+        RuntimeError: If fewer than 10 finite points survive filtering.
+    """
+    pool = sample_pool(expr, n_points * pool_mult, rng=rng)
+    return subsample_and_normalize(
+        pool, n_points, target_d, rng=rng, random_subsample=random_subsample,
+    )
 
 
 class PointCloudDataset(Dataset):
@@ -119,7 +184,7 @@ class PointCloudDataset(Dataset):
         for expr in expressions:
             try:
                 ids = expr.tokenize(tokenizer)
-            except (ValueError, Exception):
+            except Exception:
                 continue
 
             if len(ids) > max_seq_len or tokenizer.unk_id in ids:
@@ -134,6 +199,7 @@ class PointCloudDataset(Dataset):
             pad = max_seq_len - len(ids)
             self.samples.append({
                 'expr': expr,
+                'token_key': tuple(ids),
                 'input_ids': torch.tensor(ids + [tokenizer.pad_id] * pad, dtype=torch.long),
                 'attn_mask': torch.tensor([1] * len(ids) + [0] * pad, dtype=torch.long),
             })
@@ -144,6 +210,15 @@ class PointCloudDataset(Dataset):
                 f"Dropped {n_dropped_cloud} expression(s) that could not "
                 f"produce >= 10 finite points."
             )
+
+    @property
+    def token_keys(self) -> list[tuple]:
+        """Prefix token sequence of every sample, in dataset order."""
+        return [s['token_key'] for s in self.samples]
+
+    def unique_sequence_count(self) -> int:
+        """Number of distinct token sequences in the dataset."""
+        return len(set(self.token_keys))
 
     @staticmethod
     def _probe_valid(expr: Expression, n_points: int, n_tries: int = 3) -> bool:
@@ -196,10 +271,14 @@ class PointCloudDataset(Dataset):
 
 
 class MultiViewPointCloudDataset(PointCloudDataset):
-    """Dataset returning *n_views* independently sampled clouds per equation.
+    """Dataset returning *n_views* subsamples of one pool per equation.
 
     Used for subsample-JEPA: the encoder should map different numerical
     observations of the same function to similar latents.
+
+    A pool of ``n_points * pool_mult`` points is drawn per item and each view
+    takes ``view_points`` rows out of it, so the views are genuinely partial
+    observations rather than independent full draws.
 
     View seeds derive deterministically from
     ``(train_view_seed, epoch, idx, view_idx)``, so:
@@ -207,6 +286,8 @@ class MultiViewPointCloudDataset(PointCloudDataset):
     * the same expression gets fresh views every epoch;
     * runs that share data seeds but differ in lambda see identical views;
     * DataLoader worker assignment does not affect the generated views.
+
+    The pool uses ``view_idx = -1``.
 
     .. warning::
        ``self.epoch`` is read inside ``__getitem__``.  Build the training
@@ -224,6 +305,8 @@ class MultiViewPointCloudDataset(PointCloudDataset):
         max_vars: int = 9,
         n_views: int = 2,
         train_view_seed: int = 1729,
+        pool_mult: int = 4,
+        view_points: int | None = None,
     ):
         super().__init__(
             expressions, tokenizer,
@@ -232,6 +315,8 @@ class MultiViewPointCloudDataset(PointCloudDataset):
         )
         self.n_views = n_views
         self.train_view_seed = train_view_seed
+        self.pool_mult = pool_mult
+        self.view_points = view_points or n_points
         self.epoch = 0  # set by the training loop before each epoch
 
     @staticmethod
@@ -246,9 +331,17 @@ class MultiViewPointCloudDataset(PointCloudDataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
+
+        pool = sample_pool(
+            s['expr'], self.n_points * self.pool_mult,
+            rng=np.random.RandomState(
+                self.view_seed(self.train_view_seed, self.epoch, idx, -1)
+            ),
+        )
+
         views = [
-            sample_and_normalize(
-                s['expr'], self.n_points, self.target_d,
+            subsample_and_normalize(
+                pool, self.view_points, self.target_d,
                 rng=np.random.RandomState(
                     self.view_seed(self.train_view_seed, self.epoch, idx, v)
                 ),
@@ -257,13 +350,83 @@ class MultiViewPointCloudDataset(PointCloudDataset):
             for v in range(self.n_views)
         ]
         return {
-            # (n_views, n_points, target_d)
+            # (n_views, view_points, target_d)
             'points_views': torch.stack(views),
             # view 0 under the standard key, so single-view code still works
             'points': views[0],
             'input_ids': s['input_ids'],
             'attn_mask': s['attn_mask'],
         }
+
+
+def _split_indices(
+    n: int, seed: int, train_frac: float, val_frac: float,
+    groups: list | None = None,
+) -> dict[str, np.ndarray]:
+    """Shuffle 0..n-1 and cut into train/val/test index arrays.
+
+    When *groups* is given, items sharing a group key stay in one split.
+    """
+    rng = np.random.default_rng(seed)
+
+    if groups is None:
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        n_train = int(train_frac * n)
+        n_val = int(val_frac * n)
+        return {
+            'train': idx[:n_train],
+            'val': idx[n_train:n_train + n_val],
+            'test': idx[n_train + n_val:],
+        }
+
+    buckets: dict = {}
+    for i, g in enumerate(groups):
+        buckets.setdefault(g, []).append(i)
+
+    keys = list(buckets)
+    order = rng.permutation(len(keys))
+
+    # Whole buckets only, so the realised fractions drift from the requested
+    # ones when buckets are large.
+    n_train_target = int(train_frac * n)
+    n_val_target = int(val_frac * n)
+    out: dict[str, list] = {'train': [], 'val': [], 'test': []}
+    for k in order:
+        members = buckets[keys[k]]
+        if len(out['train']) < n_train_target:
+            out['train'].extend(members)
+        elif len(out['val']) < n_val_target:
+            out['val'].extend(members)
+        else:
+            out['test'].extend(members)
+
+    return {k: np.array(sorted(v), dtype=int) for k, v in out.items()}
+
+
+def _token_groups(
+    expressions: list[Expression], tokenizer: PrefixTokenizer,
+) -> list:
+    """Group key per expression: its prefix token sequence."""
+    groups = []
+    for e in expressions:
+        try:
+            groups.append(tuple(e.tokenize(tokenizer)))
+        except Exception:
+            groups.append(('__unparseable__', id(e)))
+    return groups
+
+
+def _report_leakage(datasets: dict):
+    """Print how many held-out token sequences also occur in train."""
+    train_keys = set(datasets['train'].token_keys)
+    for name in ('val', 'test'):
+        keys = datasets[name].token_keys
+        if not keys:
+            continue
+        dup = sum(1 for k in keys if k in train_keys)
+        print(f'  leakage {name}: {dup}/{len(keys)} '
+              f'({100 * dup / len(keys):.1f}%) sequences also in train')
 
 
 def build_feynman_splits(
@@ -273,23 +436,20 @@ def build_feynman_splits(
     max_seq_len: int = 64,
     max_vars: int = 9,
     seed: int = 42,
+    group_by_tokens: bool = True,
 ) -> tuple[PointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Load Feynman equations and split into train/val/test datasets.
+
+    Args:
+        group_by_tokens: Keep equations sharing a prefix token sequence in
+            the same split.
 
     Returns:
         (train_ds, val_ds, test_ds)
     """
     all_exprs = load_feynman_csv(csv_path)
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(all_exprs))
-    rng.shuffle(idx)
-    n = len(idx)
-
-    splits = {
-        'train': idx[:int(0.8 * n)],
-        'val': idx[int(0.8 * n):int(0.9 * n)],
-        'test': idx[int(0.9 * n):],
-    }
+    groups = _token_groups(all_exprs, tokenizer) if group_by_tokens else None
+    splits = _split_indices(len(all_exprs), seed, 0.8, 0.1, groups=groups)
 
     datasets = {}
     for name, indices in splits.items():
@@ -301,8 +461,10 @@ def build_feynman_splits(
             max_vars=max_vars,
             resample=(name == 'train'),
         )
-        print(f'Feynman {name}: {len(datasets[name])} equations')
+        print(f'Feynman {name}: {len(datasets[name])} equations '
+              f'({datasets[name].unique_sequence_count()} unique sequences)')
 
+    _report_leakage(datasets)
     return datasets['train'], datasets['val'], datasets['test']
 
 
@@ -316,6 +478,7 @@ def build_synthetic_splits(
     train_frac: float = 0.8,
     val_frac: float = 0.1,
     cache_eval: bool = False,
+    group_by_tokens: bool = True,
 ) -> tuple[PointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Split synthetic expressions into train/val/test datasets.
 
@@ -324,23 +487,15 @@ def build_synthetic_splits(
             re-deriving them every epoch is wasted work; caching lets an eval
             loader run with num_workers=0 at no cost.  Off by default so
             existing callers are unaffected.
+        group_by_tokens: keep expressions sharing a prefix token sequence in
+            one split, so no held-out sequence appears verbatim in train.
 
     Returns:
         (train_ds, val_ds, test_ds)
     """
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(expressions))
-    rng.shuffle(idx)
-    n = len(idx)
-
-    n_train = int(train_frac * n)
-    n_val = int(val_frac * n)
-
-    splits = {
-        'train': idx[:n_train],
-        'val': idx[n_train:n_train + n_val],
-        'test': idx[n_train + n_val:],
-    }
+    groups = _token_groups(expressions, tokenizer) if group_by_tokens else None
+    splits = _split_indices(
+        len(expressions), seed, train_frac, val_frac, groups=groups)
 
     datasets = {}
     for name, indices in splits.items():
@@ -353,25 +508,11 @@ def build_synthetic_splits(
             resample=(name == 'train'),
             cache=(cache_eval and name != 'train'),
         )
-        print(f'Synthetic {name}: {len(datasets[name])} equations')
+        print(f'Synthetic {name}: {len(datasets[name])} equations '
+              f'({datasets[name].unique_sequence_count()} unique sequences)')
 
+    _report_leakage(datasets)
     return datasets['train'], datasets['val'], datasets['test']
-
-
-def _split_indices(
-    n: int, seed: int, train_frac: float, val_frac: float,
-) -> dict[str, np.ndarray]:
-    """Shuffle 0..n-1 and cut into train/val/test index arrays."""
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    n_train = int(train_frac * n)
-    n_val = int(val_frac * n)
-    return {
-        'train': idx[:n_train],
-        'val': idx[n_train:n_train + n_val],
-        'test': idx[n_train + n_val:],
-    }
 
 
 def build_multiview_synthetic_splits(
@@ -385,32 +526,43 @@ def build_multiview_synthetic_splits(
     val_frac: float = 0.1,
     n_views: int = 2,
     train_view_seed: int = 1729,
+    pool_mult: int = 4,
+    view_points: int | None = None,
+    group_by_tokens: bool = True,
 ) -> tuple[MultiViewPointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Split synthetic expressions, with a multi-view training set.
 
-    Uses the same shuffle as build_synthetic_splits, so for a given *seed*
-    the train/val/test partition matches the single-view sweep exactly and
-    results stay comparable.  Val and test remain deterministic single-view.
+    Uses the same split logic as build_synthetic_splits, so for a given *seed*
+    and *group_by_tokens* the train/val/test partition matches the single-view
+    sweep exactly and results stay comparable.  Val and test remain
+    deterministic single-view.
 
     Returns:
         (train_ds, val_ds, test_ds)
     """
-    splits = _split_indices(len(expressions), seed, train_frac, val_frac)
+    groups = _token_groups(expressions, tokenizer) if group_by_tokens else None
+    splits = _split_indices(
+        len(expressions), seed, train_frac, val_frac, groups=groups)
 
     train_ds = MultiViewPointCloudDataset(
         [expressions[i] for i in splits['train']], tokenizer,
         n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
         n_views=n_views, train_view_seed=train_view_seed,
+        pool_mult=pool_mult, view_points=view_points,
     )
-    print(f'Synthetic train: {len(train_ds)} equations ({n_views} views each)')
+    print(f'Synthetic train: {len(train_ds)} equations '
+          f'({train_ds.unique_sequence_count()} unique sequences, '
+          f'{n_views} views each)')
 
-    eval_ds = {}
+    eval_ds = {'train': train_ds}
     for name in ('val', 'test'):
         eval_ds[name] = PointCloudDataset(
             [expressions[i] for i in splits[name]], tokenizer,
             n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
             resample=False, cache=True,
         )
-        print(f'Synthetic {name}: {len(eval_ds[name])} equations')
+        print(f'Synthetic {name}: {len(eval_ds[name])} equations '
+              f'({eval_ds[name].unique_sequence_count()} unique sequences)')
 
+    _report_leakage(eval_ds)
     return train_ds, eval_ds['val'], eval_ds['test']
