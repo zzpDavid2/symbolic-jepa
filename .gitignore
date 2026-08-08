@@ -228,3 +228,6 @@ __marimo__/
 
 # Corrupt object store kept after the 2026-08-07 packfile repair; safe to delete.
 .git.corrupt/
+
+# v2 notebook local-mode run outputs
+local_runs/
