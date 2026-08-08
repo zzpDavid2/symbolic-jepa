@@ -7,6 +7,7 @@ and algebraic equivalence checking.
 
 import numpy as np
 import sympy as sp
+import torch
 from scipy.optimize import minimize
 from tqdm.auto import tqdm
 
@@ -29,7 +30,49 @@ def r2_score(Y: np.ndarray, Y_pred: np.ndarray) -> float:
     return 1 - ss_res / (ss_tot + 1e-10)
 
 
-def teacher_forced_accuracy(logits, targets, pad_id: int) -> float:
+def build_prefix_tree(token_sequences) -> dict:
+    """Map each token prefix to its number of distinct continuations.
+
+    Fit on the train sequences and pass to teacher_forced_counts to score only
+    the positions where more than one token is possible.
+
+    Args:
+        token_sequences: iterable of token-ID sequences (e.g. dataset.token_keys).
+    """
+    counts: dict = {}
+    for seq in token_sequences:
+        seq = tuple(int(t) for t in seq)
+        for i in range(1, len(seq)):
+            counts.setdefault(seq[:i], set()).add(seq[i])
+    return {ctx: len(nxt) for ctx, nxt in counts.items()}
+
+
+def branching_mask(targets, tree: dict, pad_id: int,
+                   unseen_is_branching: bool = True):
+    """(batch, seq-1) bool mask, True where more than one continuation is possible.
+
+    Args:
+        targets: (batch, seq) — ground-truth token IDs.
+        tree: build_prefix_tree output.
+        pad_id: Token ID used for padding.
+        unseen_is_branching: How to treat a prefix absent from *tree*.
+    """
+    rows = []
+    for row in targets.tolist():
+        ctx, flags = [row[0]], []
+        for t in row[1:]:
+            if t == pad_id:
+                flags.append(False)
+            else:
+                n = tree.get(tuple(ctx))
+                flags.append(unseen_is_branching if n is None else n > 1)
+            ctx.append(t)
+        rows.append(flags)
+    return torch.tensor(rows, dtype=torch.bool, device=targets.device)
+
+
+def teacher_forced_accuracy(logits, targets, pad_id: int,
+                            branch_tree: dict | None = None) -> float:
     """Fraction of non-pad positions where argmax matches target.
 
     Excludes the trivial data-token → <sos> prediction (position 0).
@@ -38,12 +81,15 @@ def teacher_forced_accuracy(logits, targets, pad_id: int) -> float:
         logits: (batch, 1+seq, vocab) — includes data-token position.
         targets: (batch, seq) — ground-truth token IDs.
         pad_id: Token ID used for padding.
+        branch_tree: Optional build_prefix_tree output; restricts scoring to
+            positions with more than one possible continuation.
     """
-    correct, total = teacher_forced_counts(logits, targets, pad_id)
+    correct, total = teacher_forced_counts(logits, targets, pad_id, branch_tree)
     return correct / (total + 1e-10)
 
 
-def teacher_forced_counts(logits, targets, pad_id: int) -> tuple[float, float]:
+def teacher_forced_counts(logits, targets, pad_id: int,
+                          branch_tree: dict | None = None) -> tuple[float, float]:
     """Return (n_correct, n_total) for token-level accuracy.
 
     Same logic as teacher_forced_accuracy but returns raw counts
@@ -52,6 +98,8 @@ def teacher_forced_counts(logits, targets, pad_id: int) -> tuple[float, float]:
     pred = logits[:, 1:-1, :].argmax(dim=-1)   # (batch, seq-1)
     tgt = targets[:, 1:]                        # (batch, seq-1)
     mask = (tgt != pad_id)
+    if branch_tree is not None:
+        mask = mask & branching_mask(targets, branch_tree, pad_id)
     correct = ((pred == tgt) & mask).float().sum().item()
     total = mask.float().sum().item()
     return correct, total
@@ -126,6 +174,11 @@ def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
     except Exception:
         return False
 
+    return _exprs_equivalent(pred_expr, pred_consts, gt_expr, gt_consts)
+
+
+def _exprs_equivalent(pred_expr, pred_consts, gt_expr, gt_consts) -> bool:
+    """Equivalence check on already-parsed expressions."""
     # Fast path: identical SymPy expressions (handles commutativity)
     try:
         if pred_expr.equals(gt_expr):
@@ -186,6 +239,9 @@ def evaluate_predictions(
     computed on a separate held-out cloud.  Both are seeded per-sample
     for reproducibility.
 
+    ``predictions[i]`` must correspond to ``dataset.samples[i]``, so the eval
+    loader has to be built with ``shuffle=False``.
+
     Args:
         predictions: List of (ground_truth_prefix, predicted_prefix) tuples.
         dataset: PointCloudDataset (for sampling evaluation points).
@@ -198,6 +254,12 @@ def evaluate_predictions(
         Dict with 'exact_match', 'token_accuracy', 'algebraic_equiv',
         'mean_r2', 'r2_above_0.9', and per-sample 'details'.
     """
+    if len(predictions) > len(dataset.samples):
+        raise ValueError(
+            f'{len(predictions)} predictions but dataset has '
+            f'{len(dataset.samples)} samples; ordering cannot be trusted.'
+        )
+
     exact_matches = []
     token_accs = []
     equiv_matches = []
@@ -213,16 +275,19 @@ def evaluate_predictions(
         # Token accuracy
         pred_tokens = pred_str.split()
         gt_tokens = gt_str.split()
-        min_len = min(len(pred_tokens), len(gt_tokens))
-        if min_len > 0:
-            hits = sum(p == g for p, g in zip(pred_tokens[:min_len], gt_tokens[:min_len]))
-            token_accs.append(hits / max(len(pred_tokens), len(gt_tokens)))
+        denom = max(len(pred_tokens), len(gt_tokens))
+        if denom == 0:
+            token_accs.append(1.0)
+        else:
+            hits = sum(p == g for p, g in zip(pred_tokens, gt_tokens))
+            token_accs.append(hits / denom)
 
         # Parse both expressions
         parseable = False
         pred_expr = None
         pred_consts = None
         gt_expr = None
+        gt_consts = None
         try:
             pred_expr, pred_consts = prefix_to_sympy(pred_str)
             parseable = True
@@ -230,21 +295,18 @@ def evaluate_predictions(
             pass
 
         try:
-            gt_expr, _ = prefix_to_sympy(gt_str)
+            gt_expr, gt_consts = prefix_to_sympy(gt_str)
         except Exception:
             pass
 
         # ── Equivalence cascade: fast sympy first, then R² ──
         equiv = exact  # start with exact match
 
-        # Level 1: sp.expand on difference (milliseconds, no risk of hanging)
+        # Level 1: .equals, expand on difference, constant permutation
+        # (milliseconds, no risk of hanging)
         if not equiv and pred_expr is not None and gt_expr is not None:
-            try:
-                diff = sp.expand(pred_expr - gt_expr)
-                if diff is sp.S.Zero or diff == 0:
-                    equiv = 1
-            except Exception:
-                pass
+            equiv = int(_exprs_equivalent(
+                pred_expr, pred_consts, gt_expr, gt_consts))
 
         # Level 2: R² via constant fitting on fit cloud, evaluated on held-out cloud.
         # Uses deterministic RNGs seeded per-sample for reproducibility.

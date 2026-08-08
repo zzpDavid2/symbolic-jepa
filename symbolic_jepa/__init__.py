@@ -6,12 +6,14 @@ from symbolic_jepa.jepa import (
     JEPAPredictor, IdentityPredictor, jepa_loss, subsample_consistency_loss,
 )
 from symbolic_jepa.dataset import (
-    PointCloudDataset, MultiViewPointCloudDataset, sample_and_normalize,
+    PointCloudDataset, MultiViewPointCloudDataset,
+    sample_pool, subsample_and_normalize, sample_and_normalize,
     build_feynman_splits, build_synthetic_splits,
     build_multiview_synthetic_splits,
 )
 from symbolic_jepa.evaluation import (
-    r2_score, teacher_forced_accuracy, teacher_forced_counts, fit_constants,
+    r2_score, teacher_forced_accuracy, teacher_forced_counts,
+    build_prefix_tree, branching_mask, fit_constants,
     equations_equivalent, evaluate_predictions, cleanup_eval_pool,
 )
 from symbolic_jepa.diagnostics import (
