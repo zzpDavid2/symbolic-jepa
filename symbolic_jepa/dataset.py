@@ -10,12 +10,31 @@ import hashlib
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm.auto import tqdm
 
 from symbolic_jepa.expressions import Expression, load_feynman_csv
 from symbolic_jepa.tokenizer import PrefixTokenizer
 
 # Fixed seed for deterministic eval point clouds, independent of model seed.
 _EVAL_DATA_SEED = 999_999_937
+
+
+def _maybe_tqdm(iterable, progress, desc: str, total: int | None = None):
+    """Wrap *iterable* in a tqdm bar when *progress* is truthy.
+
+    *progress* may be a bool or a string; a string replaces *desc*, so callers
+    can label several bars without threading an extra argument through.
+    """
+    if not progress:
+        return iterable
+    if isinstance(progress, str):
+        desc = progress
+    if total is None:
+        try:
+            total = len(iterable)
+        except TypeError:
+            total = None
+    return tqdm(iterable, desc=desc, total=total, leave=False)
 
 
 def sample_pool(
@@ -165,6 +184,7 @@ class PointCloudDataset(Dataset):
         max_vars: int = 9,
         resample: bool = True,
         cache: bool = False,
+        progress: bool | str = False,
     ):
         self.tokenizer = tokenizer
         self.n_points = n_points
@@ -181,7 +201,9 @@ class PointCloudDataset(Dataset):
         # Pre-tokenize and filter
         self.samples: list[dict] = []
         n_dropped_cloud = 0
-        for expr in expressions:
+        # The probe below samples n_points from every expression (one lambdify
+        # each), so this loop dominates dataset construction on large sets.
+        for expr in _maybe_tqdm(expressions, progress, 'building point clouds'):
             try:
                 ids = expr.tokenize(tokenizer)
             except Exception:
@@ -307,11 +329,12 @@ class MultiViewPointCloudDataset(PointCloudDataset):
         train_view_seed: int = 1729,
         pool_mult: int = 4,
         view_points: int | None = None,
+        progress: bool | str = False,
     ):
         super().__init__(
             expressions, tokenizer,
             n_points=n_points, max_seq_len=max_seq_len,
-            max_vars=max_vars, resample=True,
+            max_vars=max_vars, resample=True, progress=progress,
         )
         self.n_views = n_views
         self.train_view_seed = train_view_seed
@@ -406,10 +429,11 @@ def _split_indices(
 
 def _token_groups(
     expressions: list[Expression], tokenizer: PrefixTokenizer,
+    progress: bool | str = False,
 ) -> list:
     """Group key per expression: its prefix token sequence."""
     groups = []
-    for e in expressions:
+    for e in _maybe_tqdm(expressions, progress, 'grouping by token sequence'):
         try:
             groups.append(tuple(e.tokenize(tokenizer)))
         except Exception:
@@ -437,18 +461,21 @@ def build_feynman_splits(
     max_vars: int = 9,
     seed: int = 42,
     group_by_tokens: bool = True,
+    progress: bool = False,
 ) -> tuple[PointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Load Feynman equations and split into train/val/test datasets.
 
     Args:
         group_by_tokens: Keep equations sharing a prefix token sequence in
             the same split.
+        progress: Show tqdm bars for the grouping and point-cloud passes.
 
     Returns:
         (train_ds, val_ds, test_ds)
     """
     all_exprs = load_feynman_csv(csv_path)
-    groups = _token_groups(all_exprs, tokenizer) if group_by_tokens else None
+    groups = (_token_groups(all_exprs, tokenizer, progress=progress)
+              if group_by_tokens else None)
     splits = _split_indices(len(all_exprs), seed, 0.8, 0.1, groups=groups)
 
     datasets = {}
@@ -460,6 +487,7 @@ def build_feynman_splits(
             max_seq_len=max_seq_len,
             max_vars=max_vars,
             resample=(name == 'train'),
+            progress=f'{name} point clouds' if progress else False,
         )
         print(f'Feynman {name}: {len(datasets[name])} equations '
               f'({datasets[name].unique_sequence_count()} unique sequences)')
@@ -479,6 +507,7 @@ def build_synthetic_splits(
     val_frac: float = 0.1,
     cache_eval: bool = False,
     group_by_tokens: bool = True,
+    progress: bool = False,
 ) -> tuple[PointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Split synthetic expressions into train/val/test datasets.
 
@@ -489,11 +518,13 @@ def build_synthetic_splits(
             existing callers are unaffected.
         group_by_tokens: keep expressions sharing a prefix token sequence in
             one split, so no held-out sequence appears verbatim in train.
+        progress: show tqdm bars for the grouping and point-cloud passes.
 
     Returns:
         (train_ds, val_ds, test_ds)
     """
-    groups = _token_groups(expressions, tokenizer) if group_by_tokens else None
+    groups = (_token_groups(expressions, tokenizer, progress=progress)
+              if group_by_tokens else None)
     splits = _split_indices(
         len(expressions), seed, train_frac, val_frac, groups=groups)
 
@@ -507,6 +538,7 @@ def build_synthetic_splits(
             max_vars=max_vars,
             resample=(name == 'train'),
             cache=(cache_eval and name != 'train'),
+            progress=f'{name} point clouds' if progress else False,
         )
         print(f'Synthetic {name}: {len(datasets[name])} equations '
               f'({datasets[name].unique_sequence_count()} unique sequences)')
@@ -529,6 +561,7 @@ def build_multiview_synthetic_splits(
     pool_mult: int = 4,
     view_points: int | None = None,
     group_by_tokens: bool = True,
+    progress: bool = False,
 ) -> tuple[MultiViewPointCloudDataset, PointCloudDataset, PointCloudDataset]:
     """Split synthetic expressions, with a multi-view training set.
 
@@ -540,7 +573,8 @@ def build_multiview_synthetic_splits(
     Returns:
         (train_ds, val_ds, test_ds)
     """
-    groups = _token_groups(expressions, tokenizer) if group_by_tokens else None
+    groups = (_token_groups(expressions, tokenizer, progress=progress)
+              if group_by_tokens else None)
     splits = _split_indices(
         len(expressions), seed, train_frac, val_frac, groups=groups)
 
@@ -549,6 +583,7 @@ def build_multiview_synthetic_splits(
         n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
         n_views=n_views, train_view_seed=train_view_seed,
         pool_mult=pool_mult, view_points=view_points,
+        progress='train point clouds' if progress else False,
     )
     print(f'Synthetic train: {len(train_ds)} equations '
           f'({train_ds.unique_sequence_count()} unique sequences, '
@@ -560,6 +595,7 @@ def build_multiview_synthetic_splits(
             [expressions[i] for i in splits[name]], tokenizer,
             n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
             resample=False, cache=True,
+            progress=f'{name} point clouds' if progress else False,
         )
         print(f'Synthetic {name}: {len(eval_ds[name])} equations '
               f'({eval_ds[name].unique_sequence_count()} unique sequences)')

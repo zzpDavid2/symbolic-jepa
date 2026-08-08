@@ -30,7 +30,7 @@ def r2_score(Y: np.ndarray, Y_pred: np.ndarray) -> float:
     return 1 - ss_res / (ss_tot + 1e-10)
 
 
-def build_prefix_tree(token_sequences) -> dict:
+def build_prefix_tree(token_sequences, progress: bool = False) -> dict:
     """Map each token prefix to its number of distinct continuations.
 
     Fit on the train sequences and pass to teacher_forced_counts to score only
@@ -38,8 +38,13 @@ def build_prefix_tree(token_sequences) -> dict:
 
     Args:
         token_sequences: iterable of token-ID sequences (e.g. dataset.token_keys).
+        progress: Show a tqdm bar. Worth it above ~50k sequences: the loop is
+            O(total tokens) prefix tuples.
     """
     counts: dict = {}
+    if progress:
+        token_sequences = tqdm(token_sequences, desc='building prefix tree',
+                               leave=False)
     for seq in token_sequences:
         seq = tuple(int(t) for t in seq)
         for i in range(1, len(seq)):

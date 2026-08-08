@@ -394,6 +394,7 @@ def load_synthetic_pkl(
     max_expressions: int = 0,
     dedupe_by_tokens: bool = True,
     max_per_sequence: int = 1,
+    progress: bool = False,
 ) -> list[Expression]:
     """Load synthetic expressions from a pickle file.
 
@@ -408,6 +409,9 @@ def load_synthetic_pkl(
         dedupe_by_tokens: Keep at most *max_per_sequence* expressions per
             distinct prefix token sequence.
         max_per_sequence: Copies to keep per distinct token sequence.
+        progress: Show a tqdm bar over the raw strings.  Each one is parsed
+            with SymPy and converted to prefix notation, so this loop is the
+            slow part of loading a large pickle.
 
     Returns:
         List of Expression objects ready for dataset construction.
@@ -432,7 +436,12 @@ def load_synthetic_pkl(
     seq_counts: dict[tuple, int] = {}
     first_errors: list[str] = []
 
-    for expr_str in expr_strings:
+    src = expr_strings
+    if progress:
+        from tqdm.auto import tqdm
+        src = tqdm(expr_strings, desc='parsing expressions', leave=False)
+
+    for expr_str in src:
         sympy_expr = _synthetic_string_to_sympy(expr_str)
         if sympy_expr is None:
             n_parse += 1

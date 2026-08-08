@@ -295,9 +295,10 @@ seed_everything(GLOBAL_SEED)
 # `max_expressions` / dedup, same grouped split, same `SYNTH_SEED`. That is what
 # makes the ablation apples-to-apples with the reported validation numbers.
 #
-# This is the expensive cell (it parses 200 000 SymPy strings). Lower
-# `MAX_SYNTH` only if you also lower it in the training notebook — otherwise the
-# splits diverge and section 4 will refuse the checkpoint.
+# This is the expensive cell — it re-parses 200 000 SymPy strings (~10-15 min)
+# and re-probes every expression's point cloud. Progress bars are enabled for
+# both. Lower `MAX_SYNTH` only if you also lower it in the training notebook —
+# otherwise the splits diverge and section 4 will refuse the checkpoint.
 
 # %%
 tokenizer = PrefixTokenizer(max_vars=MAX_VARS)
@@ -308,6 +309,7 @@ synth_exprs = load_synthetic_pkl(
     tokenizer=tokenizer,
     max_expressions=MAX_SYNTH,
     dedupe_by_tokens=DEDUPE_BY_TOKENS,
+    progress=True,
 )
 
 synth_train, synth_val, synth_test = build_synthetic_splits(
@@ -316,9 +318,10 @@ synth_train, synth_val, synth_test = build_synthetic_splits(
     seed=SYNTH_SEED,
     cache_eval=True,
     group_by_tokens=GROUP_BY_TOKENS,
+    progress=True,
 )
 
-BRANCH_TREE = build_prefix_tree(synth_train.token_keys)
+BRANCH_TREE = build_prefix_tree(synth_train.token_keys, progress=True)
 print(f'\nbranch tree: {len(BRANCH_TREE)} prefixes, '
       f'{sum(1 for v in BRANCH_TREE.values() if v > 1)} branching')
 

@@ -344,8 +344,11 @@ print(f'Global seed: {GLOBAL_SEED} | DataLoader workers: {NUM_WORKERS}')
 # comparable to v1's 10 000 — v1 had no deduplication, so an unknown fraction of
 # it was repeated sequences.
 #
-# This cell parses and tokenizes 200 000 SymPy strings and can take tens of
-# minutes. Lower `MAX_SYNTH` for a structural smoke test.
+# **This cell is slow and shows a progress bar.** The cost is SymPy: every raw
+# string is `sympify`d and converted to prefix notation at roughly 3 ms each, so
+# 200 000 strings take on the order of 10-15 minutes. Deduplication happens
+# after parsing, so it does not save any of that time. Lower `MAX_SYNTH` for a
+# structural smoke test.
 
 # %%
 tokenizer = PrefixTokenizer(max_vars=MAX_VARS)
@@ -358,6 +361,7 @@ synth_exprs = load_synthetic_pkl(
     tokenizer=tokenizer,
     max_expressions=MAX_SYNTH,
     dedupe_by_tokens=DEDUPE_BY_TOKENS,
+    progress=True,
 )
 print(f'Kept {len(synth_exprs)} expressions')
 
@@ -379,6 +383,10 @@ for expr in synth_exprs[:5]:
 # Ordinary teacher-forced accuracy is dominated by deterministic symbolic
 # syntax, so it can sit near 100% while the model gets every genuine decision
 # wrong. Both are reported, always.
+#
+# Also progress-barred: building the point clouds probes every expression with
+# an `n_points` sample (~2 ms each), and it runs once per split. The prefix tree
+# itself takes seconds.
 
 # %%
 synth_train, synth_val, synth_test = build_synthetic_splits(
@@ -387,9 +395,10 @@ synth_train, synth_val, synth_test = build_synthetic_splits(
     seed=SYNTH_SEED,
     cache_eval=True,          # val/test clouds are deterministic — cache them
     group_by_tokens=GROUP_BY_TOKENS,
+    progress=True,
 )
 
-BRANCH_TREE = build_prefix_tree(synth_train.token_keys)
+BRANCH_TREE = build_prefix_tree(synth_train.token_keys, progress=True)
 
 _train_keys = set(synth_train.token_keys)
 print(f'\nDataset summary ({EXPERIMENT_VERSION})')
