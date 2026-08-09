@@ -139,10 +139,13 @@ from symbolic_jepa import (
     PrefixTokenizer,
     TNet, SymbolicTransformer,
     JEPAPredictor, IdentityPredictor, jepa_loss,
-    build_synthetic_splits, load_synthetic_pkl,
-    build_prefix_tree, teacher_forced_counts,
+    build_synthetic_splits,
+    teacher_forced_counts,
     evaluate_predictions,
     sym_spread, pred_spread, retrieval_top1, common_mode,
+)
+from symbolic_jepa.datacache import (
+    DataCache, cached_synthetic_expressions, cached_prefix_tree,
 )
 from symbolic_jepa.checkpointing import (
     CheckpointError,
@@ -209,6 +212,7 @@ SYNTH_PKL = str(REPO_DIR / 'data' / 'synthetic.pkl')
 SYNTH_SEED = 42
 MAX_SYNTH = 200_000           # raw strings read (mentor request)
 DEDUPE_BY_TOKENS = True       # keep one example per distinct token sequence
+USE_DATA_CACHE = True         # reuse the parsed expressions / branch tree
 GROUP_BY_TOKENS = True        # no token sequence spans two splits
 
 # ── DataLoader ─────────────────────────────────────────────────────────
@@ -344,26 +348,53 @@ print(f'Global seed: {GLOBAL_SEED} | DataLoader workers: {NUM_WORKERS}')
 # comparable to v1's 10 000 — v1 had no deduplication, so an unknown fraction of
 # it was repeated sequences.
 #
-# **This cell is slow and shows a progress bar.** The cost is SymPy: every raw
-# string is `sympify`d and converted to prefix notation at roughly 3 ms each, so
-# 200 000 strings take on the order of 10-15 minutes. Deduplication happens
-# after parsing, so it does not save any of that time. Lower `MAX_SYNTH` for a
-# structural smoke test.
+# **The first run is slow (~10-15 min, with a progress bar); later runs are
+# not.** The cost is SymPy — every raw string is `sympify`d and converted to
+# prefix notation at ~3 ms each, and deduplication happens *after* parsing, so
+# it saves none of that. The parsed result is therefore cached: a fresh runtime
+# restores ~27k expressions in ~90 s instead of re-parsing 200 000 strings, and
+# the diagnostics notebook reuses the same entry.
+#
+# The expressions cannot be cached as prefix strings — `prefix_to_sympy` maps
+# every numeric literal back to a *fittable* `c_i` symbol, so the original
+# coefficients would be lost and the point clouds would be wrong. The SymPy
+# objects themselves are pickled instead.
+#
+# Set `USE_DATA_CACHE = False` to force a rebuild. Lowering `MAX_SYNTH` for a
+# smoke test is safe: it keys a separate entry and cannot collide.
+
+# %%
+# Derived-artifact cache. Parsing the pickle is the slow step and its result
+# depends only on the settings above, so it is cached content-addressed: the
+# filename embeds a hash of the source pickle, every argument that changes
+# which expressions survive, the tokenizer vocabulary, and the source of the
+# parsing modules. A changed config or a changed parser misses and rebuilds
+# under a new name — a stale entry cannot be read.
+if IN_COLAB:
+    LOCAL_CACHE_ROOT = Path('/content/symbolic_jepa_cache')
+    DRIVE_CACHE_ROOT = (DRIVE_BASE / 'symbolic_jepa_cache') if DRIVE_MOUNTED else None
+else:
+    LOCAL_CACHE_ROOT = REPO_DIR / 'local_runs' / 'symbolic_jepa_cache'
+    DRIVE_CACHE_ROOT = None
+
+CACHE = DataCache(LOCAL_CACHE_ROOT, DRIVE_CACHE_ROOT, enabled=USE_DATA_CACHE)
+print(f'data cache local : {LOCAL_CACHE_ROOT}')
+print(f'data cache drive : {DRIVE_CACHE_ROOT}')
 
 # %%
 tokenizer = PrefixTokenizer(max_vars=MAX_VARS)
 print(f'Vocab size: {len(tokenizer)}')
 
 print(f'Loading synthetic expressions from {SYNTH_PKL} ...')
-synth_exprs = load_synthetic_pkl(
-    SYNTH_PKL,
+synth_exprs = cached_synthetic_expressions(
+    SYNTH_PKL, tokenizer,
     max_seq_len=MAX_SEQ,
-    tokenizer=tokenizer,
+    max_vars=MAX_VARS,
     max_expressions=MAX_SYNTH,
     dedupe_by_tokens=DEDUPE_BY_TOKENS,
+    cache=CACHE,
     progress=True,
 )
-print(f'Kept {len(synth_exprs)} expressions')
 
 for expr in synth_exprs[:5]:
     print(f'  {expr.prefix}')
@@ -384,9 +415,14 @@ for expr in synth_exprs[:5]:
 # syntax, so it can sit near 100% while the model gets every genuine decision
 # wrong. Both are reported, always.
 #
-# Also progress-barred: building the point clouds probes every expression with
-# an `n_points` sample (~2 ms each), and it runs once per split. The prefix tree
-# itself takes seconds.
+# The tree is cached too, keyed on a hash of the training token sequences
+# themselves — so the cached tree is provably the one those sequences produce,
+# and training and diagnostics cannot drift apart. It is only a few seconds to
+# build; the cache is there for that guarantee, not for the time.
+#
+# Not cached: the point-cloud probe inside `build_synthetic_splits`, which
+# samples every expression once (~2 ms each, ~1 min total). It needs the live
+# `Expression` objects anyway, so caching it would save little.
 
 # %%
 synth_train, synth_val, synth_test = build_synthetic_splits(
@@ -398,7 +434,8 @@ synth_train, synth_val, synth_test = build_synthetic_splits(
     progress=True,
 )
 
-BRANCH_TREE = build_prefix_tree(synth_train.token_keys, progress=True)
+BRANCH_TREE = cached_prefix_tree(synth_train.token_keys, cache=CACHE,
+                                 progress=True)
 
 _train_keys = set(synth_train.token_keys)
 print(f'\nDataset summary ({EXPERIMENT_VERSION})')

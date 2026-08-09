@@ -55,6 +55,24 @@ class Expression:
         self._prefix: Optional[str] = None
         self._fn = None  # cached lambdify callable
 
+    # --- Pickling ---
+
+    def __getstate__(self):
+        """Drop the lambdify cache: it is derived, and it is not picklable.
+
+        ``sp.lambdify`` returns a function built by ``exec`` under a generated
+        name, so pickling an Expression that has been sampled would otherwise
+        fail with "Can't pickle <function _lambdifygenerated>".  It is rebuilt
+        on the next ``evaluate()``.
+        """
+        state = self.__dict__.copy()
+        state['_fn'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._fn = None
+
     # --- Constructors ---
 
     @classmethod

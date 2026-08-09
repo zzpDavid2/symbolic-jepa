@@ -111,8 +111,11 @@ from symbolic_jepa import (
     PrefixTokenizer,
     TNet, SymbolicTransformer,
     JEPAPredictor, IdentityPredictor,
-    build_synthetic_splits, load_synthetic_pkl,
-    build_prefix_tree, teacher_forced_counts,
+    build_synthetic_splits,
+    teacher_forced_counts,
+)
+from symbolic_jepa.datacache import (
+    DataCache, cached_synthetic_expressions, cached_prefix_tree,
 )
 from symbolic_jepa.checkpointing import (
     CheckpointError,
@@ -164,6 +167,7 @@ SYNTH_PKL = str(REPO_DIR / 'data' / 'synthetic.pkl')
 SYNTH_SEED = 42
 MAX_SYNTH = 200_000
 DEDUPE_BY_TOKENS = True
+USE_DATA_CACHE = True
 GROUP_BY_TOKENS = True
 
 NUM_WORKERS = 2
@@ -295,20 +299,43 @@ seed_everything(GLOBAL_SEED)
 # `max_expressions` / dedup, same grouped split, same `SYNTH_SEED`. That is what
 # makes the ablation apples-to-apples with the reported validation numbers.
 #
-# This is the expensive cell — it re-parses 200 000 SymPy strings (~10-15 min)
-# and re-probes every expression's point cloud. Progress bars are enabled for
-# both. Lower `MAX_SYNTH` only if you also lower it in the training notebook —
-# otherwise the splits diverge and section 4 will refuse the checkpoint.
+# This cell shares the training notebook's derived-artifact cache, so once
+# `jepa_pretrain_v2.ipynb` has parsed this configuration the expressions and the
+# branch tree load in seconds instead of being re-parsed (~10-15 min). The
+# point-cloud probe still runs (~1 min). The branch-tree entry is keyed on the
+# training token sequences themselves, so this notebook provably gets the same
+# tree training used. Lower `MAX_SYNTH` only if you also lower it in the
+# training notebook — otherwise the splits diverge and section 4 will refuse
+# the checkpoint.
+
+# %%
+# Derived-artifact cache. Parsing the pickle is the slow step and its result
+# depends only on the settings above, so it is cached content-addressed: the
+# filename embeds a hash of the source pickle, every argument that changes
+# which expressions survive, the tokenizer vocabulary, and the source of the
+# parsing modules. A changed config or a changed parser misses and rebuilds
+# under a new name — a stale entry cannot be read.
+if IN_COLAB:
+    LOCAL_CACHE_ROOT = Path('/content/symbolic_jepa_cache')
+    DRIVE_CACHE_ROOT = (DRIVE_BASE / 'symbolic_jepa_cache') if DRIVE_MOUNTED else None
+else:
+    LOCAL_CACHE_ROOT = REPO_DIR / 'local_runs' / 'symbolic_jepa_cache'
+    DRIVE_CACHE_ROOT = None
+
+CACHE = DataCache(LOCAL_CACHE_ROOT, DRIVE_CACHE_ROOT, enabled=USE_DATA_CACHE)
+print(f'data cache local : {LOCAL_CACHE_ROOT}')
+print(f'data cache drive : {DRIVE_CACHE_ROOT}')
 
 # %%
 tokenizer = PrefixTokenizer(max_vars=MAX_VARS)
 
-synth_exprs = load_synthetic_pkl(
-    SYNTH_PKL,
+synth_exprs = cached_synthetic_expressions(
+    SYNTH_PKL, tokenizer,
     max_seq_len=MAX_SEQ,
-    tokenizer=tokenizer,
+    max_vars=MAX_VARS,
     max_expressions=MAX_SYNTH,
     dedupe_by_tokens=DEDUPE_BY_TOKENS,
+    cache=CACHE,
     progress=True,
 )
 
@@ -321,7 +348,8 @@ synth_train, synth_val, synth_test = build_synthetic_splits(
     progress=True,
 )
 
-BRANCH_TREE = build_prefix_tree(synth_train.token_keys, progress=True)
+BRANCH_TREE = cached_prefix_tree(synth_train.token_keys, cache=CACHE,
+                                 progress=True)
 print(f'\nbranch tree: {len(BRANCH_TREE)} prefixes, '
       f'{sum(1 for v in BRANCH_TREE.values() if v > 1)} branching')
 
