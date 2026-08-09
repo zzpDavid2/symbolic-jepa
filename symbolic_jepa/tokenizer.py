@@ -1,9 +1,16 @@
 """
 Prefix tokenizer and SymPy <-> prefix conversion for SYMBA symbolic regression.
 
-35-token vocabulary matching SymPy elementary functions:
-  special(4) + variables(9) + structural numerics(4) +
-  constants(3) + operators(15) = 35
+40-token vocabulary matching SymPy elementary functions:
+  special(4) + variables(9) + structural numerics(9) +
+  constants(3) + operators(15) = 40
+
+The structural numerics cover every exponent the SYMBA_Reg_Data_Gen generator
+can produce — {2, 3, 4, -1, -2, -3, -4, 1/2} — so no exponent collapses to the
+fittable 'C' token.  That matters because 'C' is not identifiable: x**3 and
+x**4 would both tokenize to `pow x1 C`, making them indistinguishable to the
+decoder and unrecoverable by exact match.  Literals outside this set still
+fall back to 'C'.
 """
 
 from typing import Optional
@@ -17,9 +24,14 @@ import sympy as sp
 
 SPECIFIC_NUMERICS = {
     sp.Integer(-1):     'neg1',
+    sp.Integer(-2):     'neg2',
+    sp.Integer(-3):     'neg3',
+    sp.Integer(-4):     'neg4',
     sp.Rational(1, 2):  'half',
     sp.Rational(-1, 2): 'neghalf',
     sp.Integer(2):      'two',
+    sp.Integer(3):      'three',
+    sp.Integer(4):      'four',
 }
 
 FUNC_MAP = {
@@ -45,9 +57,14 @@ UNARY_OPS = {
 
 NUMERIC_VALUES = {
     'neg1':    sp.Integer(-1),
+    'neg2':    sp.Integer(-2),
+    'neg3':    sp.Integer(-3),
+    'neg4':    sp.Integer(-4),
     'half':    sp.Rational(1, 2),
     'neghalf': sp.Rational(-1, 2),
     'two':     sp.Integer(2),
+    'three':   sp.Integer(3),
+    'four':    sp.Integer(4),
 }
 
 
@@ -60,7 +77,7 @@ def sympy_to_prefix(expr, var_map: dict[str, str]) -> Optional[str]:
 
     var_map maps original variable names to numbered tokens, e.g.
     {"theta": "x1", "sigma": "x2"}.  Constants become 'C' unless they
-    are structural (neg1, half, neghalf, two, pi, e).
+    are structural (SPECIFIC_NUMERICS, pi, e).
     """
     def _rec(node):
         if node == sp.pi:
@@ -186,7 +203,8 @@ class PrefixTokenizer:
     Base vocabulary:
       - Special: <pad>, <sos>, <eos>, <unk>
       - Variables: x1..x9
-      - Structural numerics: neg1, half, neghalf, two
+      - Structural numerics: neg1, neg2, neg3, neg4, half, neghalf,
+                             two, three, four
       - Constants: C (fittable), pi, e
       - Operators: add, mul, pow, neg, sin, cos, tan, asin, acos, atan,
                    exp, log, tanh, sinh, cosh
@@ -197,7 +215,9 @@ class PrefixTokenizer:
     def __init__(self, max_vars: int = 9):
         special   = ['<pad>', '<sos>', '<eos>', '<unk>']
         variables = [f'x{i+1}' for i in range(max_vars)]
-        numerics  = ['neg1', 'half', 'neghalf', 'two']
+        numerics  = ['neg1', 'neg2', 'neg3', 'neg4',
+                     'half', 'neghalf',
+                     'two', 'three', 'four']
         constants = ['C', 'pi', 'e']
         operators = [
             'add', 'mul', 'pow', 'neg',

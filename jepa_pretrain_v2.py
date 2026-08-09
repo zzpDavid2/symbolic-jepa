@@ -125,6 +125,7 @@ sh(f'git -C "{REPO_DIR}" rev-parse --short HEAD')
 # %%
 import datetime
 import gc
+import hashlib
 import json
 import random
 import time
@@ -171,12 +172,24 @@ print(f'Device: {DEVICE}')
 # ── Experiment identity ────────────────────────────────────────────────
 # Stamped into every run_config. A v1 checkpoint carries no such field and a
 # future v3 carries a different one, so neither can validate as a v2 run.
-EXPERIMENT_VERSION = 'jepa_pretrain_v2'
+#
+# vocab40: the tokenizer gained three/four/neg2/neg3/neg4, so every exponent
+# is now a structural token instead of collapsing to 'C'. Vocabulary went
+# 27 -> 32 at MAX_VARS=1, which changes the embedding and output-projection
+# shapes — no earlier checkpoint can be loaded, and earlier metrics.json
+# files describe a different token space. Kept distinct so the pre-vocab40
+# results stay intact and comparable.
+EXPERIMENT_VERSION = 'jepa_pretrain_v2_vocab40'
 
 # Bump when DECODING or SCORING changes, independently of training. Trained
 # checkpoints stay valid; only metrics.json is invalidated, so affected runs
 # are re-scored rather than retrained.
-EVAL_VERSION = 'v2_strict_eos'
+#
+# v3: evaluation dropped sp.Expr.equals() from the equivalence cascade (it
+# hung unboundedly) and fixed the constant-permutation subs to be
+# simultaneous, which makes algebraic_equiv strictly more permissive than
+# the scores cached under v2_strict_eos.
+EVAL_VERSION = 'v3_expanded_numerics'
 
 # ── Model / optimisation (unchanged from v1) ───────────────────────────
 MAX_VARS = 1                  # univariate synthetic data
@@ -596,6 +609,13 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
     Stored in each checkpoint and in metrics.json, and compared before anything
     cached is reused. `experiment_version` and `stage` are what make v1
     checkpoints and cross-stage mix-ups structurally impossible.
+
+    `vocab_size`/`vocab_hash` make a tokenizer change structurally impossible
+    to miss even if EXPERIMENT_VERSION is not bumped: nothing else here is
+    derived from the tokenizer, so a vocabulary edit would otherwise leave
+    every field identical and let a stale metrics.json be returned verbatim.
+    The hash rather than the size alone catches reorderings and same-count
+    token swaps.
     """
     assert stage in ('pretrain', 'supervised')
     return {
@@ -616,6 +636,9 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
         'max_seq': MAX_SEQ,
         'n_points': N_POINTS,
         'max_vars': MAX_VARS,
+        'vocab_size': len(tokenizer),
+        'vocab_hash': hashlib.sha1(
+            '\x00'.join(tokenizer.vocab).encode()).hexdigest()[:12],
         'synth_seed': SYNTH_SEED,
         'max_synth': MAX_SYNTH,
         'dedupe_by_tokens': DEDUPE_BY_TOKENS,
