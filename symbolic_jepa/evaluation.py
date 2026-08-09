@@ -169,9 +169,13 @@ def fit_constants(expr, constants, X, Y, var_syms, maxiter=100):
 def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
     """Check if two prefix strings are algebraically equivalent.
 
-    Uses only fast checks (SymPy .equals and expand, no sp.simplify)
-    to avoid hanging on pathological expressions.  Handles commutativity
-    (SymPy normalizes) and constant permutation.
+    Uses only expand on the difference — no .equals, no sp.simplify — so it
+    cannot hang on pathological expressions.  Handles commutativity (SymPy
+    normalizes) and constant permutation.
+
+    Args:
+        timeout: Unused, kept for call-site compatibility.  The checks are
+            bounded by construction, so there is nothing to time out.
     """
     try:
         pred_expr, pred_consts = prefix_to_sympy(pred_str)
@@ -182,22 +186,32 @@ def equations_equivalent(pred_str: str, gt_str: str, timeout: int = 2) -> bool:
     return _exprs_equivalent(pred_expr, pred_consts, gt_expr, gt_consts)
 
 
-def _exprs_equivalent(pred_expr, pred_consts, gt_expr, gt_consts) -> bool:
-    """Equivalence check on already-parsed expressions."""
-    # Fast path: identical SymPy expressions (handles commutativity)
+def _expand_equal(a, b) -> bool:
+    """True if expand(a - b) collapses to zero.  Milliseconds, never hangs."""
     try:
-        if pred_expr.equals(gt_expr):
-            return True
+        diff = sp.expand(a - b)
+        return diff is sp.S.Zero or diff == 0
     except Exception:
-        pass
+        return False
 
-    # Try expand on the difference (fast, catches most algebraic identities)
-    try:
-        diff = sp.expand(pred_expr - gt_expr)
-        if diff is sp.S.Zero or diff == 0:
-            return True
-    except Exception:
-        pass
+
+def _exprs_equivalent(pred_expr, pred_consts, gt_expr, gt_consts) -> bool:
+    """Equivalence check on already-parsed expressions.
+
+    Deliberately avoids sp.Expr.equals(): it calls simplify() internally and
+    runs unbounded on the deep expressions greedy decoding produces (measured
+    30s+ on a single pair, vs 0.000s for expand).  On this vocabulary it
+    catches nothing expand misses; genuine algebraic equivalence that expand
+    cannot see is caught by the held-out R² check in evaluate_predictions.
+
+    Note for anyone tempted to reinstate .equals() behind a signal timeout:
+    the except-Exception clauses here swallow any Exception-derived alarm, so
+    such a guard must derive from BaseException to work at all.
+    """
+    # Fast path: expand on the difference (handles commutativity, since
+    # SymPy normalizes, plus most algebraic identities).
+    if _expand_equal(pred_expr, gt_expr):
+        return True
 
     # Constant permutation: if same number of constants, try all
     # permutations of pred constants to match gt constants.
@@ -206,15 +220,10 @@ def _exprs_equivalent(pred_expr, pred_consts, gt_expr, gt_consts) -> bool:
         from itertools import permutations
         for perm in permutations(pred_consts):
             sub = dict(zip(perm, gt_consts))
-            remapped = pred_expr.subs(sub)
-            try:
-                if remapped.equals(gt_expr):
-                    return True
-                diff2 = sp.expand(remapped - gt_expr)
-                if diff2 is sp.S.Zero or diff2 == 0:
-                    return True
-            except Exception:
-                continue
+            # simultaneous=True is required: subs applies a dict sequentially,
+            # so a swap {c_0: c_1, c_1: c_0} would collapse both onto c_0.
+            if _expand_equal(pred_expr.subs(sub, simultaneous=True), gt_expr):
+                return True
 
     return False
 
