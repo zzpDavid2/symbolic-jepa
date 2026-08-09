@@ -98,6 +98,7 @@ print(f'symbolic_jepa imported from: {symbolic_jepa.__file__}')
 # diagnostic.
 
 # %%
+import hashlib
 import json
 import random
 import shutil
@@ -138,8 +139,17 @@ print(f'Device: {DEVICE}')
 
 # %%
 # ══ Must mirror jepa_pretrain_v2.ipynb ═════════════════════════════════
-EXPERIMENT_VERSION = 'jepa_pretrain_v2'
-EVAL_VERSION = 'v2_strict_eos'
+# vocab40: the tokenizer gained three/four/neg2/neg3/neg4, so every exponent
+# is a structural token instead of collapsing to 'C'. Vocabulary went 27 -> 32
+# at MAX_VARS=1, changing the embedding and output-projection shapes — no
+# pre-vocab40 checkpoint can be loaded into this notebook's model.
+#
+# _matched: Stage 2 rebuilds its training DataLoader so both pretraining
+# conditions start fine-tuning from the same worker RNG state, and the
+# representation diagnostics use a fixed 256-example validation subset.
+# Earlier vocab40 runs used a different Stage-2 data trajectory.
+EXPERIMENT_VERSION = 'jepa_pretrain_v2_vocab40_matched'
+EVAL_VERSION = 'v3_expanded_numerics'
 
 MAX_VARS = 1
 D_INPUT = MAX_VARS + 1
@@ -233,6 +243,10 @@ def run_paths(pretrain_epochs: int, seed: int) -> dict:
 
 
 def make_run_config(pretrain_epochs: int, stage: str) -> dict:
+    # Must return exactly the same dict as the training notebook, or every
+    # checkpoint load in section 4 fails the provenance check.
+    # `tokenizer` is a forward reference to the cell below: this function is
+    # only ever *called* after that cell has run, so run the notebook in order.
     assert stage in ('pretrain', 'supervised')
     return {
         'experiment_version': EXPERIMENT_VERSION,
@@ -252,6 +266,9 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
         'max_seq': MAX_SEQ,
         'n_points': N_POINTS,
         'max_vars': MAX_VARS,
+        'vocab_size': len(tokenizer),
+        'vocab_hash': hashlib.sha1(
+            '\x00'.join(tokenizer.vocab).encode()).hexdigest()[:12],
         'synth_seed': SYNTH_SEED,
         'max_synth': MAX_SYNTH,
         'dedupe_by_tokens': DEDUPE_BY_TOKENS,
@@ -376,38 +393,113 @@ def build_model(dropout: float = DROPOUT):
 # %% [markdown]
 # ## 4. Load one trained v2 checkpoint (validated, read-only)
 #
-# `best.pt` is loaded through the same validator the training notebook uses, so
-# the checkpoint's seed, experiment version and full run configuration are
-# checked against the constants in this notebook before anything is measured.
-# Nothing here writes to the run directory.
+# `best.pt` is resolved **local first, then the Drive backup**, so a fresh Colab
+# VM that has never trained can still diagnose a run whose only surviving copy
+# is on Drive. Both candidates go through the same validator the training
+# notebook uses, so the checkpoint's seed, experiment version and full run
+# configuration are checked against the constants in this notebook before
+# anything is measured.
+#
+# The Drive copy is read in place and never installed locally, so nothing here
+# writes to either run directory — diagnostics can run while training is live.
 
 # %%
+def load_read_only(local_path, drive_path, validate, label: str):
+    """Load a checkpoint from local, falling back to the Drive backup.
+
+    Unlike the training notebook's `load_local_or_restore`, the Drive copy is
+    read in place and never installed locally.  Diagnostics must not mutate a
+    run directory a training session may be using at the same time, and this
+    notebook is only ever reading.
+
+    Both candidates go through the same validator, so a checkpoint from a
+    different run configuration is rejected rather than quietly measured.
+
+    Returns:
+        ``(checkpoint, source)`` with source ``'local'`` or ``'drive'``.
+
+    Raises:
+        CheckpointError: with one line per candidate saying why it failed.
+    """
+    problems = []
+    for source, path in (('local', local_path), ('drive', drive_path)):
+        if path is None:
+            problems.append(f'{source}: no Drive root configured')
+            continue
+        try:
+            present = Path(path).exists()
+        except OSError as e:
+            problems.append(f'{source}: unreachable ({type(e).__name__}: {e})')
+            continue
+        if not present:
+            problems.append(f'{source}: not found at {path}')
+            continue
+        try:
+            ck = load_checkpoint(path, validate=validate)
+        except Exception as e:
+            problems.append(f'{source}: {type(e).__name__}: {e}')
+            continue
+        print(f'[diagnostics] {label}: loaded from {source}\n  {path}')
+        return ck, source
+
+    raise CheckpointError(f'no usable {label}:\n  ' + '\n  '.join(problems))
+
+
+def _sibling_versions():
+    """Version directories that DO exist, to make a miss actionable.
+
+    The checkpoint roots end in EXPERIMENT_VERSION, so a run trained under a
+    different version tag is invisible to this notebook.  Listing the siblings
+    turns 'not found' into 'found, but under jepa_pretrain_v2'.
+    """
+    for label, root in (('local', LOCAL_CHECKPOINT_ROOT),
+                        ('drive', DRIVE_CHECKPOINT_ROOT)):
+        if root is None:
+            continue
+        try:
+            names = sorted(p.name for p in Path(root).parent.iterdir()
+                           if p.is_dir())
+        except OSError as e:
+            print(f'  {label} versions: unreadable ({type(e).__name__}: {e})')
+            continue
+        print(f'  {label} versions present: {names or "(none)"}')
+
+
 DIAG_PATHS = run_paths(DIAG_PRETRAIN_EPOCHS, DIAG_SEED)
 MODEL = None
 BEST_CK = None
+BEST_SOURCE = None
 
 try:
-    BEST_CK = load_checkpoint(
-        DIAG_PATHS['sup_best'],
+    BEST_CK, BEST_SOURCE = load_read_only(
+        DIAG_PATHS['sup_best'], DIAG_PATHS['drive_sup_best'],
         validate=make_validator(DIAG_PRETRAIN_EPOCHS, DIAG_SEED, 'best',
                                 'supervised', path=DIAG_PATHS['sup_best']),
+        label='best.pt',
     )
 except CheckpointError as e:
     print(f'[diagnostics] no usable checkpoint yet:\n{e}\n')
-    print('Sections 5 and 6 will be skipped; sections 7-10 still run.')
+    print(f'looking under EXPERIMENT_VERSION = {EXPERIMENT_VERSION!r}')
+    _sibling_versions()
+    print('\nSections 5 and 6 will be skipped; sections 7-10 still run.')
 
 if BEST_CK is not None:
     MODEL, _ENCODER, _PREDICTOR = build_model(dropout=0.0)
     MODEL.load_state_dict(BEST_CK['model'])
     MODEL.eval()
 
-    if DIAG_PATHS['sup_latest'].exists():
-        _latest = load_checkpoint(
-            DIAG_PATHS['sup_latest'],
+    try:
+        _latest, _ = load_read_only(
+            DIAG_PATHS['sup_latest'], DIAG_PATHS['drive_sup_latest'],
             validate=make_validator(DIAG_PRETRAIN_EPOCHS, DIAG_SEED, 'latest',
                                     'supervised',
                                     path=DIAG_PATHS['sup_latest']),
+            label='latest.pt',
         )
+    except CheckpointError as e:
+        print(f'[diagnostics] latest.pt unavailable; skipping the best/latest '
+              f'consistency check:\n{e}')
+    else:
         check_best_latest_consistency(BEST_CK, _latest,
                                       path=DIAG_PATHS['local_dir'])
         print(f'best.pt / latest.pt consistent '

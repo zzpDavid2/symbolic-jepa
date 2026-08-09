@@ -278,6 +278,7 @@ def evaluate_predictions(
     token_accs = []
     equiv_matches = []
     r2_all = []  # one entry per prediction (None if not computable)
+    r2_statuses = []  # parallel to r2_all: why each None happened
     details = []
 
     pbar = tqdm(predictions, desc='evaluate', leave=True)
@@ -324,8 +325,18 @@ def evaluate_predictions(
 
         # Level 2: R² via constant fitting on fit cloud, evaluated on held-out cloud.
         # Uses deterministic RNGs seeded per-sample for reproducibility.
+        #
+        # r2_status records WHY r2 is None.  'R²=N/A' collapses six unrelated
+        # failures into one label, and they call for different fixes: a failed
+        # constant fit is an optimiser problem, a too-small cloud is a sampling
+        # problem, an unparseable prediction is a model problem.
         r2 = None
-        if parseable and i < len(dataset.samples):
+        r2_status = 'ok'
+        if not parseable:
+            r2_status = 'pred_unparseable'
+        elif i >= len(dataset.samples):
+            r2_status = 'no_dataset_sample'
+        else:
             try:
                 expr_obj = dataset.samples[i]['expr']
                 n_vars = len(expr_obj.variables)
@@ -337,14 +348,23 @@ def evaluate_predictions(
                 fit_mask = np.isfinite(fit_cloud).all(axis=1)
                 fit_cloud = fit_cloud[fit_mask]
 
-                if len(fit_cloud) >= 50:
+                if len(fit_cloud) < 50:
+                    r2_status = f'fit_cloud_too_small({len(fit_cloud)}/{n_fit_points})'
+                else:
                     X_fit = fit_cloud[:, :n_vars]
                     Y_fit = fit_cloud[:, n_vars]
                     fitted_dict, _, _ = fit_constants(
                         pred_expr, pred_consts, X_fit, Y_fit, var_syms,
                     )
 
-                    if fitted_dict is not None:
+                    if fitted_dict is None:
+                        # L-BFGS-B never found a finite loss.  fit_constants
+                        # scores a candidate 1e10 if ANY fit point is
+                        # non-finite, so one domain violation (sqrt of a
+                        # negative, division by ~0, a non-integer power of a
+                        # negative x) flattens the objective and the fit dies.
+                        r2_status = f'constant_fit_failed(n_consts={len(pred_consts)})'
+                    else:
                         # Substitute fitted constants into expression
                         subs = {c: fitted_dict[str(c)] for c in pred_consts
                                 if str(c) in fitted_dict}
@@ -357,7 +377,10 @@ def evaluate_predictions(
                         eval_mask = np.isfinite(eval_cloud).all(axis=1)
                         eval_cloud = eval_cloud[eval_mask]
 
-                        if len(eval_cloud) >= 50:
+                        if len(eval_cloud) < 50:
+                            r2_status = (f'eval_cloud_too_small'
+                                         f'({len(eval_cloud)}/{n_eval_points})')
+                        else:
                             X_eval = eval_cloud[:, :n_vars]
                             Y_eval = eval_cloud[:, n_vars]
                             with np.errstate(all='ignore'):
@@ -365,12 +388,17 @@ def evaluate_predictions(
                                     np.asarray(f_eval(*X_eval.T), dtype=float),
                                     Y_eval.shape,
                                 ).copy()
-                            if np.all(np.isfinite(Y_pred)):
+                            n_bad = int((~np.isfinite(Y_pred)).sum())
+                            if n_bad:
+                                r2_status = (f'nonfinite_predictions'
+                                             f'({n_bad}/{len(Y_pred)})')
+                            else:
                                 r2 = r2_score(Y_eval, Y_pred)
-            except Exception:
-                r2 = None
+            except Exception as exc:
+                r2_status = f'error:{type(exc).__name__}: {exc}'
 
         r2_all.append(r2)
+        r2_statuses.append(r2_status)
 
         if r2 is not None and np.isfinite(r2):
             if not equiv and r2 >= r2_equiv_thresh:
@@ -381,6 +409,7 @@ def evaluate_predictions(
         details.append({
             'gt': gt_str, 'pred': pred_str,
             'exact': exact, 'equiv': equiv, 'r2': r2, 'parseable': parseable,
+            'r2_status': r2_status,
         })
 
         # Update progress bar with running stats
@@ -391,6 +420,13 @@ def evaluate_predictions(
 
     n = len(predictions)
     finite_r2 = [r for r in r2_all if r is not None and np.isfinite(r)]
+
+    # Collapse the parameterised statuses to their kind for the summary, so
+    # 'constant_fit_failed(n_consts=9)' and '(n_consts=12)' count together.
+    from collections import Counter
+    r2_status_counts = Counter(s.split('(')[0].split(':')[0]
+                               for s in r2_statuses)
+
     results = {
         'exact_match': np.mean(exact_matches) if exact_matches else 0,
         'token_accuracy': np.mean(token_accs) if token_accs else 0,
@@ -400,6 +436,9 @@ def evaluate_predictions(
         # R²>0.9 out of ALL predictions (not just parseable)
         'r2_above_0.9': sum(1 for r in r2_all if r is not None and r > 0.9) / max(n, 1),
         'n_parseable': sum(1 for d in details if d['parseable']),
+        'n_r2_computed': len(finite_r2),
+        # Why R² was not computable, by kind. Sums to n_total.
+        'r2_status_counts': dict(r2_status_counts.most_common()),
         'n_total': n,
         'details': details,
     }

@@ -179,7 +179,17 @@ print(f'Device: {DEVICE}')
 # shapes — no earlier checkpoint can be loaded, and earlier metrics.json
 # files describe a different token space. Kept distinct so the pre-vocab40
 # results stay intact and comparable.
-EXPERIMENT_VERSION = 'jepa_pretrain_v2_vocab40'
+#
+# _matched: Stage 2 now tears down and rebuilds its training DataLoader so
+# every pretraining condition enters fine-tuning with the same worker RNG
+# state. persistent_workers keeps one worker set alive for the whole run and
+# seed_worker only fires at worker creation, so a 10-epoch Stage 1 previously
+# left its workers 10 epochs of point-cloud draws ahead of the pretrain_0
+# baseline — confounding the very comparison this experiment makes. The
+# Stage-2 data trajectory therefore differs from earlier vocab40 runs and the
+# two cannot be pooled. Representation diagnostics also moved to a fixed
+# 256-example validation subset (weights unaffected).
+EXPERIMENT_VERSION = 'jepa_pretrain_v2_vocab40_matched'
 
 # Bump when DECODING or SCORING changes, independently of training. Trained
 # checkpoints stay valid; only metrics.json is invalidated, so affected runs
@@ -347,6 +357,50 @@ def make_eval_loader(dataset):
     order must be the dataset's own.
     """
     return DataLoader(dataset, batch_size=BATCH, shuffle=False, num_workers=0)
+
+
+# Representation diagnostics (sym_spread / pred_spread / retrieval_top1 /
+# common_mode) run on a FIXED subset of validation rather than on whichever
+# batch happened to arrive first. One batch is BATCH=16 examples, far too few
+# to read a trend from — retrieval_top1 in particular has chance = 1/16 there,
+# so it is dominated by which 16 equations landed in batch 0.
+#
+# The subset is drawn once from a CONSTANT seed, independent of the model seed,
+# so it is the same examples every epoch, the same for pretrain_0 and
+# pretrain_10, and the same across model seeds. Full-validation loss and
+# accuracy still use the entire set; only these four diagnostics are subset.
+REPR_DIAG_N = 256
+_REPR_DIAG_SEED = 20_250_809
+
+
+def make_repr_diag_loader(dataset, n: int = REPR_DIAG_N,
+                          seed: int = _REPR_DIAG_SEED):
+    """Deterministic fixed-subset loader for the representation diagnostics."""
+    n = min(n, len(dataset))
+    idx = np.random.RandomState(seed).choice(len(dataset), size=n, replace=False)
+    subset = Subset(dataset, sorted(int(i) for i in idx))
+    return DataLoader(subset, batch_size=BATCH, shuffle=False, num_workers=0)
+
+
+def representation_embeddings(model, predictor, loader):
+    """(z_sym, z_pred) concatenated over the whole fixed diagnostic subset.
+
+    Returns (None, None) for an empty loader.
+    """
+    model.eval()
+    predictor.eval()
+    zs, zp = [], []
+    with torch.no_grad(), amp_ctx():
+        for batch in loader:
+            points = batch['points'].to(DEVICE, non_blocking=True)
+            input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
+            attn_mask = batch['attn_mask'].to(DEVICE, non_blocking=True)
+            out = model(points, input_ids, attn_mask=attn_mask)
+            zs.append(model.encode_expression(input_ids, attn_mask=attn_mask))
+            zp.append(predictor(out['z_num']))
+    if not zs:
+        return None, None
+    return torch.cat(zs, dim=0), torch.cat(zp, dim=0)
 
 
 seed_everything(GLOBAL_SEED)
@@ -841,11 +895,18 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
 # TensorBoard, and `metrics.json`.
 
 # %%
-def validate_epoch(model, predictor, val_loader):
+def validate_epoch(model, predictor, val_loader, repr_loader=None):
     """One full validation pass with token-weighted aggregation.
 
     Returns loss, ordinary token accuracy, branching-position accuracy, their
     denominators, and the JEPA alignment diagnostics.
+
+    Loss / accuracy / the JEPA term always use the FULL val_loader.  The
+    `z_sym` / `z_pred` embeddings behind the representation diagnostics come
+    from *repr_loader*, a fixed deterministic subset — see
+    `make_repr_diag_loader`.  Passing None falls back to the first validation
+    batch, which is the old ~16-example behaviour and is far too noisy to read
+    a trend from.
     """
     model.eval()
     predictor.eval()
@@ -887,6 +948,10 @@ def validate_epoch(model, predictor, val_loader):
                 diag_z_sym, diag_z_pred = z_sym_v, z_pred_v
             n_batches += 1
 
+    if repr_loader is not None:
+        diag_z_sym, diag_z_pred = representation_embeddings(
+            model, predictor, repr_loader)
+
     return {
         'val': val_loss_sum / max(val_tokens_total, 1),
         'val_acc': acc_correct / max(acc_total, 1),
@@ -896,6 +961,7 @@ def validate_epoch(model, predictor, val_loader):
         'jepa': align_sum / max(n_batches, 1),
         'z_sym': diag_z_sym,
         'z_pred': diag_z_pred,
+        'n_repr': 0 if diag_z_sym is None else int(diag_z_sym.shape[0]),
     }
 
 
@@ -939,6 +1005,7 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 
     train_loader, train_gen = make_train_loader(synth_train, seed)
     val_loader = make_eval_loader(synth_val)
+    repr_loader = make_repr_diag_loader(synth_val)
 
     optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -998,7 +1065,7 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 
     if writer is None:
         del model, encoder, predictor, optimizer, scheduler
-        del train_loader, val_loader
+        del train_loader, val_loader, repr_loader
         gc.collect()
         return
 
@@ -1013,8 +1080,29 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
     del sup_ck
 
     # ── Stage 2 ────────────────────────────────────────────────────────
+    # Rebuild the training loader so every pretraining condition ENTERS Stage 2
+    # with the same worker RNG state.
+    #
+    # `persistent_workers=True` keeps one set of workers alive for the whole
+    # run and `seed_worker` only fires at worker *creation*, so the workers'
+    # NumPy streams advance continuously. `train_gen.manual_seed(es)` pins the
+    # shuffle order but not those streams — point clouds are drawn worker-side
+    # from the global NumPy RNG (`resample=True` passes `rng=None`). A
+    # 10-epoch Stage 1 therefore leaves its workers 10 epochs advanced, and
+    # `pretrain_10` would meet Stage 2 on different clouds than `pretrain_0` —
+    # confounding exactly the comparison this experiment exists to make.
+    #
+    # Done unconditionally, not just after Stage 1, so the loader is created at
+    # the same point with the same seed in both arms. Nothing else about the
+    # training setup changes.
+    del train_loader, train_gen
+    gc.collect()                      # joins the old workers before respawning
+    train_loader, train_gen = make_train_loader(synth_train, seed)
+
     print(f'\n=== Stage 2: CE fine-tuning ({FINETUNE_EPOCHS} epochs, '
           f'loss = CE only, epoch seed = {seed} + 100000 + epoch) ===')
+    print(f'    train loader rebuilt for Stage 2 '
+          f'(workers={NUM_WORKERS}, seed={seed}) so both arms start matched')
 
     for epoch in range(start_epoch, FINETUNE_EPOCHS + 1):
         es = stage2_epoch_seed(seed, epoch)
@@ -1061,7 +1149,7 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 
         is_best = False
         if epoch % VAL_EVERY == 0 or epoch == FINETUNE_EPOCHS:
-            v = validate_epoch(model, predictor, val_loader)
+            v = validate_epoch(model, predictor, val_loader, repr_loader)
             history['val'].append(v['val'])
             history.setdefault('val_acc', []).append(v['val_acc'])
             history.setdefault('val_branch_acc', []).append(v['val_branch_acc'])
@@ -1161,7 +1249,8 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
                               paths['manifest'], verbose=False)
 
     writer.close()
-    del train_loader, val_loader, model, encoder, predictor, optimizer, scheduler
+    del train_loader, val_loader, repr_loader
+    del model, encoder, predictor, optimizer, scheduler
     if DEVICE == 'cuda':
         torch.cuda.empty_cache()
     gc.collect()
@@ -1266,6 +1355,10 @@ def eval_one(pretrain_epochs, seed, synth_test):
         'mean_r2': results['mean_r2'],
         'median_r2': results['median_r2'],
         'n_parseable': results['n_parseable'],
+        'n_r2_computed': results['n_r2_computed'],
+        # Why R2 was not computable, by kind (constant_fit_failed,
+        # pred_unparseable, ...). Sums to n_total.
+        'r2_status_counts': results['r2_status_counts'],
         'n_total': results['n_total'],
         'details': results['details'],
     }
