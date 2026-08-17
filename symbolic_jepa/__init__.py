@@ -11,6 +11,13 @@ from symbolic_jepa.dataset import (
     build_feynman_splits, build_synthetic_splits,
     build_multiview_synthetic_splits,
 )
+from symbolic_jepa.templates import (
+    ConstantTemplate, ConstantSampler, DynamicConstantPointCloudDataset,
+    InstantiatedExpression, templatize,
+    build_templates_from_strings, build_template_splits,
+    save_template_dataset, load_template_dataset,
+    canonical_split_report, describe_realizations, audit_constant_sampling,
+)
 from symbolic_jepa.evaluation import (
     r2_score, teacher_forced_accuracy, teacher_forced_counts,
     build_prefix_tree, branching_mask, fit_constants,
