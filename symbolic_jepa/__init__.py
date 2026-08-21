@@ -13,8 +13,10 @@ from symbolic_jepa.dataset import (
 )
 from symbolic_jepa.templates import (
     ConstantTemplate, ConstantSampler, DynamicConstantPointCloudDataset,
-    InstantiatedExpression, templatize,
+    DynamicConstantMultiViewDataset, InstantiatedExpression, templatize,
+    AUGMENTATION_VERSION, augmentation_seed, templates_fingerprint,
     build_templates_from_strings, build_template_splits,
+    build_multiview_template_splits,
     save_template_dataset, load_template_dataset,
     canonical_split_report, describe_realizations, audit_constant_sampling,
 )

@@ -14,93 +14,65 @@
 # ---
 
 # %% [markdown]
-# # Dynamic constant augmentation — `jepa_constant_aug_v1`
+# # Subsample JEPA — on the corrected v2 pipeline
 #
-# Same two-stage experiment as `jepa_pretrain_v2_l8.ipynb`, with **one** change:
-# the training set stores *canonical structures* and resamples their numerical
-# coefficients on every `__getitem__`.
-#
-# ## The question
-#
-# > Does exposing each symbolic structure to many numerical coefficient
-# > realisations improve structural learning, and make JEPA pretraining more
-# > useful?
-#
-# Deduplicating 200 000 raw strings by prefix token sequence leaves each
-# canonical form backed by exactly **one** coefficient realisation. The encoder
-# can therefore memorise a coefficient pattern rather than the structure its
-# target tokens actually describe — a plausible contributor to the project's
-# central gap (high teacher-forced token accuracy, low exact symbolic recovery).
+# Rerun of the simple subsample-invariance pretraining experiment using the
+# fixed training/evaluation code, so the result is comparable to
+# `jepa_pretrain_v2` (`jepa_pretrain_v2_vocab40_matched`) rather than to the
+# older `subsample_jepa.ipynb` sweep.
 #
 # ```text
-# canonical structure     c0*sin(c1*x1) + c2
-#     |  sample constants
-#     v
-# numerical function      2.1*sin(0.8*x1) + 4.3     <- new every epoch
-#     |  sample x points
-#     v
-# point cloud             -> encoder
-#
-# decoder target          C sin C x1 + C            <- identical, always
-# ```
-#
-# ## What is held fixed
-#
-# Everything. Model (**8 layers**, matching `jepa_pretrain_v2_l8`), optimiser,
-# schedule, JEPA objective, tokenizer, evaluation, `SYNTH_SEED`, and the
-# raw-string horizon are unchanged, and `build_template_splits` reuses the same
-# `_split_indices` call as `build_synthetic_splits`, so **the train/val/test
-# partition is identical to the baseline's**. Any difference in the metrics is
-# attributable to the augmentation.
-#
-# The baseline to compare against is `jepa_pretrain_v2_l8` itself — that path is
-# untouched and still reads `data/synthetic.pkl`, so no backward-compatibility
-# switch is needed here. `DYNAMIC_CONSTANTS = False` remains available as a
-# same-notebook control (it serves each template's original realisation and
-# reproduces the baseline bit-for-bit, pinned by
-# `tests/test_constant_templates.py`), but it is not the default.
-#
-# ## No leakage
-#
-# The **canonical form is the split unit**, and coefficients are drawn only
-# after the split. Section 4 asserts the three pairwise overlaps are zero and
-# raises if not — we are measuring generalisation to unseen *structures*, not
-# the easier setting of a seen structure with new numbers.
-#
-# Validation and test stay deterministic: fixed structures, fixed coefficients,
-# fixed clouds. A moving evaluation set could not be compared across epochs.
-#
-# ```text
-# Stage 1  JEPA-only pretraining   (pretrain_epochs)
-#    |     encoder learns to predict a fixed symbolic target
+# Stage 1  subsample-invariance pretraining   (pretrain_epochs)
+#    |     E(S_A) ~= sg(E(S_B))  for two subsamples of ONE function's cloud
+#    |     trains the T-Net encoder only
 #    v
-# Stage 2  CE-only fine-tuning     (FINETUNE_EPOCHS)
+# Stage 2  CE-only fine-tuning                (FINETUNE_EPOCHS)
 #    |
 #    v
 #        greedy decode + symbolic evaluation
 # ```
 #
-# Swept variable: `pretrain_epochs ∈ {0, 10}` at `seed = 42`. **`0` is the
-# baseline** — Stage 1 is skipped and the run is plain CE training. If seed 42
-# looks promising this extends to the full multi-seed comparison by putting
-# `SEEDS` carries the eight seeds the reported comparison was run over.
+# ## The objective
 #
-# ## What changed from `jepa_pretrain_v2`
+# For two random subsamples \(S_A, S_B\) drawn from the same function's point
+# cloud, ask only that the encoder map them to the same latent:
 #
-# | Area | `jepa_pretrain_v2` | here |
+# \[ E(S_A) \approx \operatorname{sg}(E(S_B)) \]
+#
+# No symbolic target, no predictor MLP, no `[PRED]` tokens. This is deliberately
+# the simplest subsample representation-alignment objective there is: the sole
+# claim being tested is that invariance to *which points you happen to observe*
+# is a useful prior for the encoder.
+#
+# ## The comparison
+#
+# | run | Stage 1 |
+# |---|---|
+# | `pretrain_0` | skipped — plain CE training, the baseline |
+# | `pretrain_10` | 10 epochs of subsample-invariance pretraining |
+#
+# Paired over seeds `42, 123, 7`.
+#
+# ## What is shared with the corrected baseline
+#
+# Everything downstream of Stage 1 is unchanged and deliberately so — splits
+# (same `SYNTH_SEED`, same `group_by_tokens`, so the partition is identical),
+# Stage-2 CE fine-tuning, checkpoint provenance, greedy decoding, and scoring.
+# `pretrain_0` here and `pretrain_0` in the baseline differ only in which
+# Stage-1 objective was skipped, so the two experiments are directly comparable.
+#
+# ## What differs from the old `subsample_jepa.ipynb`
+#
+# | Area | old sweep | here |
 # |---|---|---|
-# | Training expressions | one fixed realisation per canonical form | canonical template + coefficients resampled per `__getitem__` |
-# | Decoder target | from the realisation | from the **template** — cannot move with the coefficients |
-# | Dataset source | `data/synthetic.pkl` reparsed and deduped per runtime (10-15 min) | `data/synthetic_templates.pkl`, deduped once offline |
-# | Split unit | prefix token sequence | canonical form (the same thing, asserted explicitly) |
-# | Dataset length | *unchanged* | *unchanged* — same epochs, same optimizer steps |
-# | Val / test | deterministic | deterministic, and with the **same** coefficients as the baseline |
-#
-# This notebook shares **no** checkpoint path with `jepa_pretrain_v2` and never
-# resumes from, migrates, or overwrites one of its checkpoints.
-# `run_config.experiment_version` makes that structurally impossible, and
-# `run_config` additionally carries every constant-sampling setting, so a run
-# with different augmentation cannot silently reuse a cached `metrics.json`.
+# | Framing | one-stage, CE + λ·subsample jointly | two-stage, pretrain then fine-tune |
+# | Swept variable | λ ∈ {0 … 0.3} | pretrain_epochs ∈ {0, 10} |
+# | Gradient | both views carry gradient | `sg` on the target view |
+# | Raw expressions | 10 000, no dedup | 200 000, one per distinct token sequence |
+# | Splits | random | grouped by token sequence (no verbatim leakage) |
+# | Vocabulary | 27 tokens (`x**3`, `x**4` → `C`) | 32 tokens, every exponent structural |
+# | Checkpoints | written straight to Drive | atomic local write, verified, then Drive backup |
+# | Val metrics | token accuracy | + branching-position accuracy |
 #
 # Diagnostics (zero/shuffled-input ablations, worker-RNG check, checkpoint
 # fault injection, tiny-set overfit) live in
@@ -158,13 +130,9 @@ if IN_COLAB:
 
     # Do NOT blanket-install sympy: Colab preinstalls it (torch depends on
     # it), and pip replacing it under a live kernel leaves the already-imported
-    # module object stale. `torch.utils._sympy.functions` is imported LAZILY —
-    # nothing in `import torch` or a forward pass touches it — so the mismatch
-    # does not surface at setup. It surfaces the first time training reaches it,
-    # as `AttributeError: module 'sympy' has no attribute 'core'` raised 13
-    # frames inside `train_one`, which looks nothing like a packaging problem.
-    # Install only what is genuinely missing, and demand a restart if anything
-    # was.
+    # module object stale. `torch.utils._sympy.functions` is imported LAZILY, so
+    # the mismatch does not surface at setup — it surfaces mid-training as
+    # `AttributeError: module 'sympy' has no attribute 'core'`.
     _missing = []
     for _mod in ('sympy', 'scipy'):
         try:
@@ -174,8 +142,7 @@ if IN_COLAB:
     if _missing:
         sh(f'{sys.executable} -m pip install -q {" ".join(_missing)}')
         print(f'\n[SETUP] installed {_missing} — RESTART THE RUNTIME NOW '
-              f'(Runtime > Restart session), then re-run. Continuing in this '
-              f'kernel will fail later inside training.')
+              f'(Runtime > Restart session), then re-run.')
     else:
         print('sympy / scipy already present — not reinstalling')
 else:
@@ -208,12 +175,9 @@ import time
 
 import numpy as np
 import torch
-# Imported eagerly on purpose. torch defers `torch.utils._sympy.functions`
-# until something deep in training needs it, so a torch/sympy version mismatch
-# detonates mid-run instead of here. Touching it now moves that failure into
-# setup, where it is two seconds and one restart to fix. `sympy.core` for the
-# same reason `expressions.py` imports `sympy.assumptions`: to force the
-# submodule attribute to exist rather than trusting lazy resolution.
+# Imported eagerly: torch defers `torch.utils._sympy.functions` until something
+# deep in training needs it, so a torch/sympy mismatch would otherwise detonate
+# mid-run rather than here.
 import sympy.core                     # noqa: F401
 import torch.utils._sympy.functions   # noqa: F401
 from torch.utils.data import DataLoader, Subset
@@ -223,14 +187,16 @@ from tqdm.auto import tqdm
 from symbolic_jepa import (
     PrefixTokenizer,
     TNet, SymbolicTransformer,
-    JEPAPredictor, IdentityPredictor, jepa_loss,
+    subsample_consistency_loss,
     teacher_forced_counts,
     evaluate_predictions,
-    sym_spread, pred_spread, retrieval_top1, common_mode,
+    view_consistency_diagnostics, generate_diagnostic_embeddings,
 )
-from symbolic_jepa.datacache import DataCache, cached_prefix_tree
+from symbolic_jepa.datacache import (
+    DataCache, cached_prefix_tree,
+)
 from symbolic_jepa.templates import (
-    AUGMENTATION_VERSION, ConstantSampler, build_template_splits,
+    AUGMENTATION_VERSION, ConstantSampler, build_multiview_template_splits,
     load_template_dataset, templates_fingerprint,
     canonical_split_report, describe_realizations, audit_constant_sampling,
 )
@@ -257,51 +223,43 @@ print(f'Device: {DEVICE}')
 
 # %%
 # ── Experiment identity ────────────────────────────────────────────────
-# Stamped into every run_config. A v1 checkpoint carries no such field and a
-# future v3 carries a different one, so neither can validate as a v2 run.
+# Subsample-invariance pretraining on the corrected v2 pipeline.
 #
-# vocab40: the tokenizer gained three/four/neg2/neg3/neg4, so every exponent
-# is now a structural token instead of collapsing to 'C'. Vocabulary went
-# 27 -> 32 at MAX_VARS=1, which changes the embedding and output-projection
-# shapes — no earlier checkpoint can be loaded, and earlier metrics.json
-# files describe a different token space. Kept distinct so the pre-vocab40
-# results stay intact and comparable.
+# Stage 1 replaces the equation-token JEPA objective with the simplest
+# subsample-alignment objective: for two random subsamples S_A, S_B of the SAME
+# function's point cloud,
 #
-# _matched: Stage 2 now tears down and rebuilds its training DataLoader so
-# every pretraining condition enters fine-tuning with the same worker RNG
-# state. persistent_workers keeps one worker set alive for the whole run and
-# seed_worker only fires at worker creation, so a 10-epoch Stage 1 previously
-# left its workers 10 epochs of point-cloud draws ahead of the pretrain_0
-# baseline — confounding the very comparison this experiment makes. The
-# Stage-2 data trajectory therefore differs from earlier vocab40 runs and the
-# two cannot be pooled. Representation diagnostics also moved to a fixed
-# 256-example validation subset (weights unaffected).
+#     E(S_A)  ~=  sg( E(S_B) )
 #
-# constant_aug_v1: the training set resamples coefficients per __getitem__.
-# Depth, width and vocabulary are identical to jepa_pretrain_v2_l8, so its
-# checkpoints would LOAD here without complaint — only a distinct
-# EXPERIMENT_VERSION keeps one from being resumed into this run, and run_config
-# additionally carries every constant-sampling setting.
-EXPERIMENT_VERSION = 'jepa_constant_aug_v1'
+# No predictor MLP, no symbolic target, no [PRED] tokens. The only thing being
+# asked of the encoder is invariance to WHICH points of a function it sees.
+#
+# Everything downstream — splits, Stage-2 CE fine-tuning, checkpointing,
+# decoding, evaluation — is byte-identical to jepa_pretrain_v2_vocab40_matched,
+# so `pretrain_0` here and `pretrain_0` there differ only by which Stage-1
+# objective was skipped.
+# constant_aug_v1: the training set stores canonical structures and resamples
+# their coefficients per __getitem__, with all views of one item sharing one
+# realisation. Weights are shape-compatible with subsample_jepa_v2's, so only a
+# distinct EXPERIMENT_VERSION keeps one from being resumed into this run;
+# run_config additionally carries every constant-sampling setting, the
+# augmentation version and the template fingerprint.
+EXPERIMENT_VERSION = 'subsample_constant_aug_v1'
 
 # Bump when DECODING or SCORING changes, independently of training. Trained
 # checkpoints stay valid; only metrics.json is invalidated, so affected runs
-# are re-scored rather than retrained.
-#
-# v3: evaluation dropped sp.Expr.equals() from the equivalence cascade (it
-# hung unboundedly) and fixed the constant-permutation subs to be
-# simultaneous, which makes algebraic_equiv strictly more permissive than
-# the scores cached under v2_strict_eos.
+# are re-scored rather than retrained. Shared with the baseline: identical
+# decoder and identical scorer.
 EVAL_VERSION = 'v3_expanded_numerics'
 
-# ── Model / optimisation (identical to jepa_pretrain_v2_l8) ────────────
+# ── Model / optimisation (unchanged from v1) ───────────────────────────
 MAX_VARS = 1                  # univariate synthetic data
 D_INPUT = MAX_VARS + 1        # (x, y) = 2
 N_POINTS = 1000
 MAX_SEQ = 64
 D_MODEL = 512
 N_HEADS = 8
-N_LAYERS = 8                  # matches jepa_pretrain_v2_l8, the baseline here
+N_LAYERS = 4
 DROPOUT = 0.2
 
 LR = 3e-4
@@ -311,24 +269,46 @@ VAL_EVERY = 1
 USE_AMP = True
 
 # ── The comparison ─────────────────────────────────────────────────────
-# Eight seeds. The augmentation's effect on `equiv` / `R2>0.9` is ~0.7 pp with
-# a per-seed sd of ~0.5-0.7 pp, so three seeds cannot resolve it and eight can:
-# paired t p=0.018 (equiv) and p=0.004 (R2>0.9), 7/8 seeds positive.
+# v1 swept {0, 5, 10, 15}; v2 establishes the corrected baseline for the
+# 0-vs-10 comparison, paired by seed. Add values back here to widen the sweep.
 FINETUNE_EPOCHS = 30
 PRETRAIN_EPOCHS_VALUES = [0, 10]
-SEEDS = [42, 123, 7, 3095, 4003, 492, 4550, 6928]
+SEEDS = [42, 123, 7]
 GLOBAL_SEED = SEEDS[0]        # notebook-level RNG; per-run seeds come from SEEDS
 
-# ── JEPA objective used in Stage 1 (unchanged from v1) ─────────────────
-JEPA_LOSS = 'cosine'          # 'cosine' (ordinary) | 'centered'
-JEPA_PREDICTOR = 'identity'   # 'identity' | 'mlp'
-PRETRAIN_STOPGRAD = True      # see the note below — False collapses Stage 1
+# ── Subsample objective used in Stage 1 ────────────────────────────────
+# 'centered' subtracts each view's batch mean before the cosine. Use it. The
+# T-Net max-pools ReLU features into the positive orthant, so RAW cosine
+# between any two embeddings starts ~0.99 and the raw loss starts ~5e-4 — too
+# small to produce gradient. Worse, the raw objective is *minimised* by total
+# collapse (all-equal embeddings drive it to 0), whereas the centered one
+# *penalises* collapse (drives it to 1).
+SUBSAMPLE_LOSS = 'centered'   # 'centered' (recommended) | 'cosine'
+# The mode we do NOT optimise, logged alongside for reference: free to compute
+# and it shows how the two scales move relative to each other.
+SUBSAMPLE_LOSS_OTHER = 'cosine' if SUBSAMPLE_LOSS == 'centered' else 'centered'
+PRETRAIN_STOPGRAD = True      # E(S_A) ~= sg(E(S_B)); see the note in section 7
+
+N_VIEWS = 2                   # subsamples per equation per step
+POOL_MULT = 4                 # draw N_POINTS*POOL_MULT, then subsample views
+VIEW_POINTS = None            # points per view (None = N_POINTS)
+# TRAIN_VIEW_SEED and FINETUNE_VIEW_EPOCH_OFFSET are gone. Views now derive
+# from (run seed, STAGE, epoch, idx, view), and `stage` is what keeps Stage 2
+# from replaying the exact clouds Stage 1 pretrained on — a named separation
+# rather than an epoch offset large enough to hope for no collision.
+
+# ── Fixed view-consistency diagnostic ──────────────────────────────────
+# Same clouds for every checkpoint and every model, so reported differences
+# reflect the encoder rather than the data.
+EVAL_SEED = 2718
+DIAG_N_EXPRS = 256            # val equations used for the diagnostic
+DIAG_N_VIEWS = 4              # views per equation
 
 # ── Data ───────────────────────────────────────────────────────────────
-# The canonical forms come from data/synthetic_templates.pkl, built once by
+# Canonical forms come from data/synthetic_templates.pkl, built once by
 #   python tools/build_template_dataset.py --max-expressions 200000 --max-vars 1
-# from the same 200 000 raw strings MAX_SYNTH selects, with the same filters and
-# in the same order. The split is therefore the baseline's split.
+# from the same 200 000 raw strings, with the same filters and in the same
+# order — so the split matches subsample_jepa_v2's exactly.
 TEMPLATE_PKL = str(REPO_DIR / 'data' / 'synthetic_templates.pkl')
 SYNTH_PKL = str(REPO_DIR / 'data' / 'synthetic.pkl')   # source of the above
 SYNTH_SEED = 42
@@ -338,61 +318,33 @@ USE_DATA_CACHE = True         # reuse the branch tree
 GROUP_BY_TOKENS = True        # no canonical form spans two splits
 
 # ── Dynamic constant augmentation ──────────────────────────────────────
-# THE swept feature of this notebook. The baseline to compare against is
-# jepa_pretrain_v2_l8 itself, whose data path is untouched; False here is a
-# same-notebook control, not a compatibility switch.
+# Composes with the multi-view objective rather than replacing it:
+#
+#   sample constants -> one function
+#         |
+#         +-- pool of N_POINTS*POOL_MULT points
+#               +-- view 0 ... view N_VIEWS-1     (same function)
+#
+# All views of one item share ONE coefficient draw. Views must differ in which
+# points were observed, not in which function was observed, or the consistency
+# objective is trained against a false premise.
 DYNAMIC_CONSTANTS = True
 
-# 'global': every coefficient of every canonical form draws its MAGNITUDE from
-# ONE shared pool, fitted on the training forms only. This is the point of the
-# mode — if form F drew from F's own observed coefficients, those coefficients
-# would still identify F, which is exactly the shortcut the augmentation exists
-# to remove. The SIGN comes from the form's reference coefficient, because sign
-# is structural rather than nuisance: exp(c*(x-mu)**2) is a Gaussian bump at
-# c < 0 and a divergence at c > 0. Measured over 400 training forms x 4 draws:
-#
-#   sampler                                   accept rate   forms starved
-#   global signed pool, free sign                   0.749           4.2%
-#   global magnitude pool + reference sign          0.980           0.0%
-#   per-form pool ('empirical')                     0.997           0.2%
-#
-# Free signs do not buy extra uniformity — rejection just re-imposes the sign
-# constraint afterwards, unevenly, and starves a tail of forms.
-#
-# 'empirical' keeps the per-form pools; it is the form-biased ablation.
-# 'perturb' needs no pools: reference value x log-uniform, sign kept.
+# 'global': every coefficient of every form draws its MAGNITUDE from one shared
+# pool fitted on the training forms only, so a form's coefficients cannot
+# identify it. Sign comes from the reference because sign is structural.
 CONSTANT_MODE = 'global'
-CONSTANT_LOG_SPREAD = 2.0     # 'perturb' spread, and the per-slot fallback
-CONSTANT_JITTER = 1.0         # >1 makes pooled draws continuous, not a grid
-
-# None draws from the global NumPy RNG, exactly how the existing point-cloud
-# augmentation is seeded (per worker, by seed_worker). An int instead pins
-# coefficients to (seed, epoch, idx) — but then the train loader MUST be built
-# with persistent_workers=False, or forked workers never see the epoch update.
-# Under DETERMINISTIC_AUGMENTATION every realisation is a pure function of
-# (run seed, stage, epoch, sample index) — see symbolic_jepa/templates.py.
-# Nothing reads mutable global RNG state inside a worker, so worker count,
-# worker scheduling, process restart and checkpoint resume cannot change what
-# an example sees. That matters here because the JEPA effect is ~0.7 pp: a
-# resumed run that re-rolled its augmentation would move the result by an
-# uncontrolled amount indistinguishable from the effect.
-#
-# Set False for the legacy stochastic stream (global NumPy RNG, per-worker
-# seeded). Reproducible only for an uninterrupted run at a fixed worker count.
-DETERMINISTIC_AUGMENTATION = True
-
-# The base seed is the RUN seed, assigned in train_one, so the two pretrain
-# arms at one seed see the same augmentation sequence and the comparison stays
-# paired. This placeholder only puts the dataset in deterministic mode and
-# makes the section-4 diagnostics representative of SEEDS[0].
-CONSTANT_SEED = SEEDS[0] if DETERMINISTIC_AUGMENTATION else None
-
-# Redraws allowed before an example falls back to its reference coefficients.
-# Rejection catches the two pathologies resampling can introduce: a coefficient
-# near zero that erases a branch and leaves a constant output column, and one
-# that blows the output past CONSTANT_MAX_ABS.
+CONSTANT_LOG_SPREAD = 2.0
+CONSTANT_JITTER = 1.0
 CONSTANT_MAX_TRIES = 8
 CONSTANT_MAX_ABS = 1e6
+
+# Every realisation is a pure function of (run seed, stage, epoch, idx), so
+# worker count, worker scheduling, process restart and checkpoint resume cannot
+# change what an example sees. Resuming is then scientifically equivalent to
+# never having interrupted. The base seed is bound to the RUN seed in train_one.
+DETERMINISTIC_AUGMENTATION = True
+CONSTANT_SEED = SEEDS[0] if DETERMINISTIC_AUGMENTATION else None
 
 # ── DataLoader ─────────────────────────────────────────────────────────
 # Workers fork from identical NumPy/Python RNG state and would emit identical
@@ -405,45 +357,47 @@ NUM_WORKERS = 2
 # ── Evaluation ─────────────────────────────────────────────────────────
 MAX_EVAL_EXAMPLES = 0         # 0 = full test set; a positive N caps greedy decode
 
-# Symbolic metrics DURING training, so the JEPA advantage can be read as a
-# curve over epochs rather than a single end-of-run number. val_loss and
-# val_acc are already per-epoch, but they are nearly flat across arms — the
-# effect lives in `equiv` and `R2>0.9`, which need greedy decoding plus BFGS
-# constant fitting and so are far too slow to run every epoch on the full set.
-#
-# COST: roughly SYMBOLIC_EVAL_N * (decode + an 11-parameter BFGS fit). At 128
-# examples that is tens of seconds, paid FINETUNE_EPOCHS/SYMBOLIC_EVAL_EVERY
-# times per run. Set SYMBOLIC_EVAL_EVERY = 0 to switch it off entirely.
-SYMBOLIC_EVAL_EVERY = 5       # epochs between mid-training symbolic evals
-SYMBOLIC_EVAL_N = 128         # validation examples per mid-training eval
+# Symbolic metrics DURING training, so the advantage can be read as a curve
+# rather than one end-of-run number. COST: SYMBOLIC_EVAL_N greedy decodes plus
+# an ~11-parameter BFGS fit each, every SYMBOLIC_EVAL_EVERY epochs.
+# Set SYMBOLIC_EVAL_EVERY = 0 to switch it off.
+SYMBOLIC_EVAL_EVERY = 5
+SYMBOLIC_EVAL_N = 128
 
 # ── Drive backup cadence ───────────────────────────────────────────────
 DRIVE_BACKUP_EVERY = 5        # epochs between latest.pt backups
 
 # %% [markdown]
-# ### Why `PRETRAIN_STOPGRAD` must stay `True`
+# ### Why `PRETRAIN_STOPGRAD` stays `True`, and why `centered` matters
 #
-# Stage 1 optimises the JEPA loss alone. With gradients reaching both sides
-# (`encoder` and `tok_embed`/`pos_embed`/`transformer`/`norm`, with `head.weight`
-# tied to `tok_embed.weight`), the pair is free to converge on one constant
-# vector: `cos = 1`, loss = 0, nothing learned. Measured over 6 JEPA-only epochs
-# (d_model=128, 458 equations), `stopgrad=False` drove JEPA loss 1.028 → 0.0037
-# while `std(z_sym)` fell 0.716 → 0.078 and off-diagonal `cos(z_sym)` rose
-# 0.473 → 0.994 — the full collapse signature.
+# The objective is stated as \(E(S_A) \approx \operatorname{sg}(E(S_B))\), so
+# view 0 carries the gradient and the remaining views are fixed targets. Unlike
+# the token-JEPA target in the baseline, `detach()` alone is sufficient here:
+# both sides come from the same T-Net, which has no dropout on this path, so
+# there is no risk of the "fixed" target moving between the two encodes. The
+# baseline's `model.eval()` dance is therefore not needed.
 #
-# With the stop-gradient, Stage 1 trains **only the T-Net encoder** against a
-# fixed, randomly-initialised symbolic target. The decoder is not pretrained,
-# so this measures *"does JEPA-pretraining the point-cloud encoder help?"*, not
-# *"does pretraining the whole model help?"*
+# Stage 1 touches **only the T-Net encoder**. The loss is a function of encoder
+# outputs alone, so the decoder never receives a gradient — this measures
+# *"does subsample-invariance pretraining of the point-cloud encoder help?"*,
+# not *"does pretraining the whole model help?"*
 #
-# `torch.no_grad()` alone is **not** sufficient — it blocks gradients but leaves
-# dropout active, so the "fixed" target would be re-sampled every step. Stage 1
-# therefore puts the model in `eval()` while computing the target.
+# **Collapse is the thing to watch.** The trivial solution to "make two views
+# agree" is to map everything to one constant vector. Two guards:
+#
+# * `SUBSAMPLE_LOSS = 'centered'` subtracts each view's batch mean before the
+#   cosine. Under total collapse every centered vector is 0, cosine evaluates
+#   to 0, and the loss goes to **1** — the centered objective *penalises*
+#   collapse. The raw objective is *minimised* by it, which makes raw actively
+#   dangerous here in a way it was not in the joint-loss sweep.
+# * `pretrain/std_z_num` is logged every epoch. It falling toward 0 is the
+#   collapse signature; `val/gap_centered` going to 0 while `same_fn_cos`
+#   stays high is the same story seen from the validation side.
 #
 # The mentor commit rewrote `encode_expression` to prepend a learned
-# `null_data_token` and index the last real token as `attn_mask.sum()` rather
-# than `attn_mask.sum() - 1`. v2 calls the library implementation directly; the
-# old hand-rolled token alignment is **not** reproduced here.
+# `null_data_token`. That path is unused here — this objective never encodes
+# expressions — but the library implementation is called directly wherever it
+# does appear.
 
 # %% [markdown]
 # ## 2. Reproducibility / worker seeding
@@ -486,7 +440,7 @@ def seed_worker(worker_id: int) -> None:
 
 
 def stage1_epoch_seed(seed: int, epoch: int) -> int:
-    """RNG seed for one JEPA-pretraining epoch."""
+    """RNG seed for one subsample-pretraining epoch."""
     return seed + 200_000 + epoch
 
 
@@ -505,18 +459,16 @@ def make_train_loader(dataset, seed: int):
     """
     g = torch.Generator()
     g.manual_seed(seed)
-    # A seeded constant stream reads `dataset.epoch` inside __getitem__, and a
-    # persistent worker holds a forked copy that would never see the parent's
-    # update — freezing every epoch onto the same coefficients. Cheaper to drop
-    # persistence than to make the freeze detectable after the fact.
-    persistent = NUM_WORKERS > 0 and getattr(
-        dataset, 'constant_seed', None) is None
     loader = DataLoader(
         dataset,
         batch_size=BATCH,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        persistent_workers=persistent,
+        # MUST stay False. MultiViewPointCloudDataset reads `self.epoch`
+        # inside __getitem__, and workers hold a FORKED COPY of the dataset —
+        # persistent workers would never observe the epoch bump and every
+        # epoch's views would silently freeze at epoch 0.
+        persistent_workers=False,
         pin_memory=(DEVICE == 'cuda'),
         worker_init_fn=seed_worker,
         generator=g,
@@ -524,49 +476,13 @@ def make_train_loader(dataset, seed: int):
     return loader, g
 
 
-def make_eval_loader(dataset):
-    """Deterministic loader for validation / test: no shuffle, no workers.
-
-    `evaluate_predictions` indexes `dataset.samples[i]` positionally, so the
-    order must be the dataset's own.
-    """
-    return DataLoader(dataset, batch_size=BATCH, shuffle=False, num_workers=0)
-
-
-# Representation diagnostics (sym_spread / pred_spread / retrieval_top1 /
-# common_mode) run on a FIXED subset of validation rather than on whichever
-# batch happened to arrive first. One batch is BATCH=16 examples, far too few
-# to read a trend from — retrieval_top1 in particular has chance = 1/16 there,
-# so it is dominated by which 16 equations landed in batch 0.
-#
-# The subset is drawn once from a CONSTANT seed, independent of the model seed,
-# so it is the same examples every epoch, the same for pretrain_0 and
-# pretrain_10, and the same across model seeds. Full-validation loss and
-# accuracy still use the entire set; only these four diagnostics are subset.
-REPR_DIAG_N = 256
-_REPR_DIAG_SEED = 20_250_809
-
-
-def make_repr_diag_loader(dataset, n: int = REPR_DIAG_N,
-                          seed: int = _REPR_DIAG_SEED):
-    """Deterministic fixed-subset loader for the representation diagnostics."""
-    n = min(n, len(dataset))
-    idx = np.random.RandomState(seed).choice(len(dataset), size=n, replace=False)
-    subset = Subset(dataset, sorted(int(i) for i in idx))
-    return DataLoader(subset, batch_size=BATCH, shuffle=False, num_workers=0)
-
-
 def symbolic_eval_subset(model, dataset, n=None):
     """Greedy-decode the first *n* examples of *dataset* and score them.
 
     `evaluate_predictions` pairs predictions to `dataset.samples[i]` by
-    POSITION, so decoding a prefix of the dataset in order is all that is
-    needed — wrapping it in a `Subset` would hide `.samples` and break that
-    pairing.
-
-    The first *n* rather than a random *n*: the split was already random, so a
-    prefix is an arbitrary sample of it, and a fixed prefix is comparable
-    across epochs, arms and seeds without threading another seed through.
+    POSITION, so decoding a prefix in order is all that is needed — a `Subset`
+    wrapper would hide `.samples` and break that pairing. A fixed prefix is
+    comparable across epochs, arms and seeds without another seed to carry.
     """
     n = min(n or SYMBOLIC_EVAL_N, len(dataset))
     loader = DataLoader(Subset(dataset, range(n)), batch_size=BATCH,
@@ -595,70 +511,77 @@ def symbolic_eval_subset(model, dataset, n=None):
     }
 
 
-def representation_embeddings(model, predictor, loader):
-    """(z_sym, z_pred) concatenated over the whole fixed diagnostic subset.
+def make_eval_loader(dataset):
+    """Deterministic loader for validation / test: no shuffle, no workers.
 
-    Returns (None, None) for an empty loader.
+    `evaluate_predictions` indexes `dataset.samples[i]` positionally, so the
+    order must be the dataset's own.
     """
-    model.eval()
-    predictor.eval()
-    zs, zp = [], []
-    with torch.no_grad(), amp_ctx():
-        for batch in loader:
-            points = batch['points'].to(DEVICE, non_blocking=True)
-            input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
-            attn_mask = batch['attn_mask'].to(DEVICE, non_blocking=True)
-            out = model(points, input_ids, attn_mask=attn_mask)
-            zs.append(model.encode_expression(input_ids, attn_mask=attn_mask))
-            zp.append(predictor(out['z_num']))
-    if not zs:
-        return None, None
-    return torch.cat(zs, dim=0), torch.cat(zp, dim=0)
+    return DataLoader(dataset, batch_size=BATCH, shuffle=False, num_workers=0)
+
+
+# Representation diagnostic: same-function vs different-function cosine on a
+# FIXED set of views, not on whichever validation batch arrived first.
+#
+# `generate_diagnostic_embeddings` seeds every cloud from
+# (EVAL_SEED, 0, expr_idx, view_idx), so the SAME clouds are encoded for every
+# epoch, every pretraining condition and every model seed — a change in the
+# reported numbers is a change in the encoder, never in the data. This is the
+# direct read on the Stage-1 objective: subsample invariance should raise
+# same_fn_cos without dragging diff_fn_cos up with it.
+#
+# Read the *_centered numbers. The T-Net max-pools ReLU activations into the
+# positive orthant, so raw cosine between ANY two embeddings sits near 0.98
+# regardless of content; centering strips that shared offset. `gap_centered`
+# (same - diff) is the headline: it is high only when the encoder is both
+# subsample-invariant AND still discriminating between functions, so it cannot
+# be gamed by collapse the way same_fn_cos alone can.
+
+
+def view_consistency(model, val_ds, n_exprs: int = DIAG_N_EXPRS,
+                     n_views: int = DIAG_N_VIEWS):
+    """same/diff-function cosine on the fixed diagnostic views."""
+    z = generate_diagnostic_embeddings(
+        val_ds, model.encoder, n_exprs=n_exprs, n_views=n_views,
+        eval_seed=EVAL_SEED, device=DEVICE, batch_size=BATCH,
+    )
+    return view_consistency_diagnostics(z, n_views)
 
 
 seed_everything(GLOBAL_SEED)
 print(f'Global seed: {GLOBAL_SEED} | DataLoader workers: {NUM_WORKERS}')
 
 # %% [markdown]
-# ## 3. Tokenizer and canonical templates
+# ## 3. Tokenizer and data loading
 #
-# Deduplication no longer happens here. It is a pure function of the corpus and
-# the tokenizer vocabulary — not of any run — so it is done **once**, offline:
+# `max_expressions=200_000` caps the **raw strings read** from the pickle;
+# `dedupe_by_tokens=True` then keeps one expression per distinct prefix token
+# sequence. The kept count is therefore much smaller than 200 000 and is *not*
+# comparable to v1's 10 000 — v1 had no deduplication, so an unknown fraction of
+# it was repeated sequences.
 #
-# ```bash
-# python tools/build_template_dataset.py \
-#     --input data/synthetic.pkl \
-#     --output data/synthetic_templates.pkl \
-#     --max-expressions 200000 --max-vars 1
-# ```
+# **The first run is slow (~10-15 min, with a progress bar); later runs are
+# not.** The cost is SymPy — every raw string is `sympify`d and converted to
+# prefix notation at ~3 ms each, and deduplication happens *after* parsing, so
+# it saves none of that. The parsed result is therefore cached: a fresh runtime
+# restores ~27k expressions in ~90 s instead of re-parsing 200 000 strings, and
+# the diagnostics notebook reuses the same entry.
 #
-# That is the 10-15 minutes of SymPy every previous runtime paid (~3 ms per raw
-# string, and deduplication happens *after* parsing so it saves none of it).
-# Loading the result is seconds, and needs no content-addressed cache entry.
+# The expressions cannot be cached as prefix strings — `prefix_to_sympy` maps
+# every numeric literal back to a *fittable* `c_i` symbol, so the original
+# coefficients would be lost and the point clouds would be wrong. The SymPy
+# objects themselves are pickled instead.
 #
-# Each record holds three things:
-#
-# * the **template** — `c0*sin(c1*x1) + c2` — whose prefix is the decoder target;
-# * the **reference realisation**, the original SymPy expression kept verbatim,
-#   so `DYNAMIC_CONSTANTS = False` reproduces the old pipeline exactly rather
-#   than approximately;
-# * per-slot **constant pools** harvested from every raw string that
-#   deduplicated away, instead of discarding those ~198 500 realisations.
-#   Under `CONSTANT_MODE = 'global'` these are not used per-form — they are
-#   aggregated into the one shared magnitude pool. They stay per-form in the
-#   file so the `'empirical'` ablation remains available without a rebuild.
-#
-# Structural numerics are *not* coefficient slots. `x**2` keeps its `two` and
-# `sin(3*x + phi)` keeps its `three`; only the amplitude and phase resample.
-# Collapsing an exponent to `C` would make `x**3` and `x**4` indistinguishable
-# to the decoder, which is exactly what the 40-token vocabulary exists to avoid.
+# Set `USE_DATA_CACHE = False` to force a rebuild. Lowering `MAX_SYNTH` for a
+# smoke test is safe: it keys a separate entry and cannot collide.
 
 # %%
-# Derived-artifact cache. Expression parsing has moved offline into
-# data/synthetic_templates.pkl, so the only thing left to cache here is the
-# branching prefix tree. It stays content-addressed on the training token
-# sequences themselves: the cached tree is provably the one those sequences
-# produce, and a different split can never hit the entry.
+# Derived-artifact cache. Parsing the pickle is the slow step and its result
+# depends only on the settings above, so it is cached content-addressed: the
+# filename embeds a hash of the source pickle, every argument that changes
+# which expressions survive, the tokenizer vocabulary, and the source of the
+# parsing modules. A changed config or a changed parser misses and rebuilds
+# under a new name — a stale entry cannot be read.
 if IN_COLAB:
     LOCAL_CACHE_ROOT = Path('/content/symbolic_jepa_cache')
     DRIVE_CACHE_ROOT = (DRIVE_BASE / 'symbolic_jepa_cache') if DRIVE_MOUNTED else None
@@ -674,11 +597,9 @@ print(f'data cache drive : {DRIVE_CACHE_ROOT}')
 tokenizer = PrefixTokenizer(max_vars=MAX_VARS)
 print(f'Vocab size: {len(tokenizer)}')
 
-# `data/` is gitignored (synthetic.pkl is 194 MB), so a fresh clone has
-# neither file. On Colab both live in the Drive-resident repo. If the template
-# file is missing but the raw pickle is there, build it once, here — the same
-# code path as tools/build_template_dataset.py, ~11 min, and it persists to
-# Drive so no later runtime pays it again.
+print(f'Loading synthetic expressions from {SYNTH_PKL} ...')
+# `data/` is gitignored, so a fresh clone has neither file. On Colab both live
+# in the Drive-resident repo. Build the template file once if it is missing.
 if not Path(TEMPLATE_PKL).exists():
     print(f'{TEMPLATE_PKL} not found — building from {SYNTH_PKL} '
           f'(~11 min, one time)')
@@ -698,56 +619,35 @@ if not Path(TEMPLATE_PKL).exists():
         max_seq_len=MAX_SEQ, max_vars=MAX_VARS, seed=SYNTH_SEED))
     del _raw, _tmpls
 
-print(f'Loading canonical templates from {TEMPLATE_PKL} ...')
 templates, template_meta = load_template_dataset(TEMPLATE_PKL, tokenizer)
 print(f'  {len(templates)} canonical forms '
       f'(built {template_meta.get("created")} from '
       f'{template_meta.get("max_expressions")} raw strings)')
-print(f'  realisations pooled : {template_meta.get("n_pooled")}')
-print(f'  pool size per slot  : min {template_meta.get("pool_min")}, '
-      f'median {template_meta.get("pool_median")}, '
-      f'max {template_meta.get("pool_max")}')
-print(f'  forms with a single realisation: '
-      f'{template_meta.get("n_single_realization")}')
-
 if template_meta.get('max_expressions') != MAX_SYNTH:
-    print(f'\n[WARNING] template file was built from '
+    print(f'\n[WARNING] template file built from '
           f'{template_meta.get("max_expressions")} raw strings but MAX_SYNTH is '
-          f'{MAX_SYNTH}; the canonical form set — and therefore the split — '
-          f'differs from the baseline run. Rebuild with '
-          f'--max-expressions {MAX_SYNTH} before comparing.')
+          f'{MAX_SYNTH}; the form set and split differ from the baseline.')
 
-for tmpl in templates[:5]:
-    print(f'  [{tmpl.n_constants} slots] {tmpl.prefix}')
-
-# Left unfitted here on purpose: build_template_splits fits the shared pool on
-# the TRAINING forms once the split exists, and prints what it fitted.
+TEMPLATE_FINGERPRINT = templates_fingerprint(templates)
 CONSTANT_SAMPLER = ConstantSampler(
-    mode=CONSTANT_MODE,
-    log_spread=CONSTANT_LOG_SPREAD,
-    jitter=CONSTANT_JITTER,
-)
-print(f'\nconstant sampler: {CONSTANT_MODE} '
-      f'(log_spread={CONSTANT_LOG_SPREAD}, jitter={CONSTANT_JITTER}) | '
-      f'DYNAMIC_CONSTANTS={DYNAMIC_CONSTANTS}')
+    mode=CONSTANT_MODE, log_spread=CONSTANT_LOG_SPREAD,
+    jitter=CONSTANT_JITTER)
+print(f'  template fingerprint : {TEMPLATE_FINGERPRINT}')
+print(f'  augmentation version : {AUGMENTATION_VERSION}')
+print(f'  constant sampler     : {CONSTANT_MODE} | '
+      f'DYNAMIC_CONSTANTS={DYNAMIC_CONSTANTS} | '
+      f'DETERMINISTIC={DETERMINISTIC_AUGMENTATION}')
+
+for expr in templates[:5]:
+    print(f'  {expr.prefix}')
 
 # %% [markdown]
-# ## 4. Dataset splits, leakage assertions, and the branching prefix tree
+# ## 4. Corrected dataset splits and branching prefix tree
 #
 # `group_by_tokens=True` keeps every expression sharing a prefix token sequence
 # inside one split, so no held-out sequence appears verbatim in train. The
 # library prints its own leakage diagnostic — that is the authoritative one and
 # is not duplicated here.
-#
-# Because the canonical form *is* the token sequence, that guarantee is exactly
-# the no-leakage condition this experiment needs, and
-# `canonical_split_report` re-checks it on the **built datasets** (after
-# construction has dropped anything unusable) and raises if any pairwise
-# overlap is non-zero. Coefficients are drawn only inside `__getitem__`, i.e.
-# strictly after the split.
-#
-# Only the training split carries dynamic constants. `build_template_splits`
-# forces `dynamic_constants=False` on val and test regardless of the flag.
 #
 # `BRANCH_TREE` is built **once**, from the finalised training split only. It
 # maps each token prefix to the number of distinct continuations seen in
@@ -762,21 +662,26 @@ print(f'\nconstant sampler: {CONSTANT_MODE} '
 # and training and diagnostics cannot drift apart. It is only a few seconds to
 # build; the cache is there for that guarantee, not for the time.
 #
-# Not cached: the point-cloud probe inside `build_template_splits`, which
-# samples every reference expression once (~2 ms each, ~1 min total). It needs
-# the live `Expression` objects anyway, so caching it would save little.
+# Not cached: the point-cloud probe inside `build_synthetic_splits`, which
+# samples every expression once (~2 ms each, ~1 min total). It needs the live
+# `Expression` objects anyway, so caching it would save little.
 
 # %%
-synth_train, synth_val, synth_test = build_template_splits(
+# Train is multi-view; val/test stay deterministic single-view and cached.
+# Same split logic, same SYNTH_SEED and same group_by_tokens as
+# build_synthetic_splits, so the partition matches the baseline run exactly
+# and the two experiments are directly comparable.
+synth_train, synth_val, synth_test = build_multiview_template_splits(
     templates, tokenizer,
     n_points=N_POINTS, max_seq_len=MAX_SEQ, max_vars=MAX_VARS,
     seed=SYNTH_SEED,
+    n_views=N_VIEWS, pool_mult=POOL_MULT, view_points=VIEW_POINTS,
     dynamic_constants=DYNAMIC_CONSTANTS,
     sampler=CONSTANT_SAMPLER,
     constant_seed=CONSTANT_SEED,
     max_constant_tries=CONSTANT_MAX_TRIES,
     max_abs=CONSTANT_MAX_ABS,
-    cache_eval=True,          # val/test clouds are deterministic — cache them
+    cache_eval=True,
     group_by_tokens=GROUP_BY_TOKENS,
     progress=True,
 )
@@ -803,21 +708,22 @@ print(f'  branching prefixes (>1 next tok)  : '
       f'{sum(1 for v in BRANCH_TREE.values() if v > 1)}')
 print(f'  dynamic constants (train)         : '
       f'{synth_train.dynamic_constants}')
+print(f'  deterministic augmentation        : '
+      f'{synth_train.deterministic_augmentation}')
+print(f'  template fingerprint              : {TEMPLATE_FINGERPRINT}')
+print(f'  augmentation version              : {AUGMENTATION_VERSION}')
 
 # %% [markdown]
 # ### Leakage: the canonical form is the split unit
 #
-# Raises if any pairwise overlap is non-zero.
+# Coefficients are drawn only inside `__getitem__`, i.e. strictly after the
+# split. Raises if any pairwise overlap is non-zero.
 
 # %%
 CANONICAL_REPORT = canonical_split_report(synth_train, synth_val, synth_test)
 
 # %% [markdown]
 # ### The invariant: coefficients move, the decoder target does not
-#
-# Three canonical forms, each shown with its reference realisation and two
-# freshly sampled ones. All of them must tokenize to the identical target;
-# `describe_realizations` raises if any does not.
 
 # %%
 describe_realizations(synth_train, n_forms=3, n_realizations=3, seed=0)
@@ -825,35 +731,25 @@ describe_realizations(synth_train, n_forms=3, n_realizations=3, seed=0)
 # %% [markdown]
 # ### Rejection statistics
 #
-# The dataset's own counters live in whichever process called `__getitem__`, so
-# with `NUM_WORKERS > 0` they stay at zero in this one. This runs the same draw
-# path here instead. A high fallback rate would mean the sampled coefficients
-# are frequently pathological and the distribution needs revisiting.
+# The dataset's counters live in whichever process called `__getitem__`, so
+# with workers they stay at zero here. This runs the same draw path in-process.
+# A high fallback rate would mean sampled coefficients are frequently
+# pathological and the distribution needs revisiting.
 
 # %%
 CONSTANT_AUDIT = audit_constant_sampling(synth_train, n=256, seed=0)
-
-# %% [markdown]
-# ### Resume identity
-#
-# `TEMPLATE_FINGERPRINT` goes into every checkpoint's `run_config`. A template
-# file rebuilt with different settings changes the canonical forms AND the
-# split, but the weights would still load — the fingerprint is what makes that
-# mismatch impossible rather than merely unlikely.
-
-# %%
-TEMPLATE_FINGERPRINT = templates_fingerprint(templates)
-print(f'template fingerprint    : {TEMPLATE_FINGERPRINT}')
-print(f'augmentation version    : {AUGMENTATION_VERSION}')
-print(f'deterministic augment.  : {DETERMINISTIC_AUGMENTATION}')
-print(f'train deterministic     : {synth_train.deterministic_augmentation}')
 
 # %% [markdown]
 # ## 5. Model construction
 
 # %%
 def build_model(dropout: float = DROPOUT):
-    """Fresh encoder + decoder + JEPA predictor on DEVICE."""
+    """Fresh encoder + decoder on DEVICE.
+
+    No predictor: the subsample objective aligns two encoder outputs directly,
+    so there is nothing to predict *with*. The return signature keeps a third
+    slot for symmetry with the baseline driver, always None.
+    """
     encoder = TNet(d_input=D_INPUT, d_model=D_MODEL)
     model = SymbolicTransformer(
         encoder=encoder, vocab_size=len(tokenizer),
@@ -862,11 +758,7 @@ def build_model(dropout: float = DROPOUT):
         dropout=dropout, pad_id=tokenizer.pad_id,
     ).to(DEVICE)
 
-    # Always built: 'identity' is parameter-free, and both Stage 1 and the
-    # validation diagnostics need it.
-    predictor = (JEPAPredictor(D_MODEL).to(DEVICE) if JEPA_PREDICTOR == 'mlp'
-                 else IdentityPredictor().to(DEVICE))
-    return model, encoder, predictor
+    return model, encoder, None
 
 
 def make_amp_ctx():
@@ -914,7 +806,7 @@ amp_ctx = make_amp_ctx()
 # ### Per-run layout
 #
 # ```text
-# jepa_pretrain_v2_vocab40_matched_l8/
+# jepa_pretrain_v2/
 #     pretrain_0/  seed_42/  pretrain/    latest.pt
 #                            supervised/  latest.pt  best.pt
 #                                         metrics.json  manifest.json
@@ -1004,8 +896,23 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
         'pretrain_epochs': pretrain_epochs,
         'finetune_epochs': FINETUNE_EPOCHS,
         'pretrain_stopgrad': PRETRAIN_STOPGRAD,
-        'jepa_loss': JEPA_LOSS,
-        'jepa_predictor': JEPA_PREDICTOR,
+        'subsample_loss': SUBSAMPLE_LOSS,
+        'n_views': N_VIEWS,
+        'pool_mult': POOL_MULT,
+        'view_points': VIEW_POINTS,
+        # Constant augmentation is part of what a run means, and the last three
+        # make a resume against different augmentation or a different
+        # canonical-template dataset structurally impossible.
+        'dynamic_constants': DYNAMIC_CONSTANTS,
+        'constant_mode': CONSTANT_MODE,
+        'constant_log_spread': CONSTANT_LOG_SPREAD,
+        'constant_jitter': CONSTANT_JITTER,
+        'constant_seed': CONSTANT_SEED,
+        'constant_max_tries': CONSTANT_MAX_TRIES,
+        'constant_max_abs': CONSTANT_MAX_ABS,
+        'deterministic_augmentation': DETERMINISTIC_AUGMENTATION,
+        'augmentation_version': AUGMENTATION_VERSION,
+        'template_fingerprint': TEMPLATE_FINGERPRINT,
         'lr': LR,
         'weight_decay': WEIGHT_DECAY,
         'batch': BATCH,
@@ -1023,26 +930,6 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
         'max_synth': MAX_SYNTH,
         'dedupe_by_tokens': DEDUPE_BY_TOKENS,
         'group_by_tokens': GROUP_BY_TOKENS,
-        # Constant augmentation is part of what a run *means*: two runs that
-        # differ only here are different experiments, and neither may resume
-        # from nor reuse the other's cached metrics.
-        'dynamic_constants': DYNAMIC_CONSTANTS,
-        'constant_mode': CONSTANT_MODE,
-        'constant_log_spread': CONSTANT_LOG_SPREAD,
-        'constant_jitter': CONSTANT_JITTER,
-        'constant_seed': CONSTANT_SEED,
-        'constant_max_tries': CONSTANT_MAX_TRIES,
-        'constant_max_abs': CONSTANT_MAX_ABS,
-        # Resume safety. `augmentation_version` changes if the mapping from
-        # (seed, stage, epoch, idx) to a realisation ever changes, so a resume
-        # cannot continue under different augmentation than the epochs already
-        # trained. `template_fingerprint` pins the canonical-template dataset:
-        # a file rebuilt with a different --max-expressions would change both
-        # the forms and the split, and the weights would load without
-        # complaint.
-        'deterministic_augmentation': DETERMINISTIC_AUGMENTATION,
-        'augmentation_version': AUGMENTATION_VERSION,
-        'template_fingerprint': TEMPLATE_FINGERPRINT,
     }
 
 
@@ -1097,8 +984,17 @@ def backup_and_record(local_path, drive_path, manifest_path, verbose=True) -> bo
 
 # %%
 def run_pretraining(model, predictor, params, pretrain_epochs, seed,
-                    paths, writer, train_loader, train_gen, history):
-    """Stage 1: JEPA-only pretraining. Resumable, local-first."""
+                    paths, writer, train_loader, train_gen, history,
+                    train_ds=None):
+    """Stage 1: subsample-invariance pretraining. Resumable, local-first.
+
+    Objective, for two random subsamples S_A, S_B of one function's cloud:
+
+        E(S_A)  ~=  sg( E(S_B) )
+
+    Only the encoder is trained — the decoder never sees a gradient here,
+    because the loss is a function of encoder outputs alone.
+    """
     if pretrain_epochs == 0:
         return
 
@@ -1114,8 +1010,6 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
     if ck is not None:
         model.load_state_dict(ck['model'])
         pre_opt.load_state_dict(ck['optimizer'])
-        if 'predictor' in ck and isinstance(predictor, JEPAPredictor):
-            predictor.load_state_dict(ck['predictor'])
         for key, values in ck.get('history', {}).items():
             history[key] = list(values)
         start_epoch = ck['epoch'] + 1
@@ -1125,81 +1019,87 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
             return
         print(f'  Stage 1 resuming at epoch {start_epoch} (source={source})')
 
-    print(f'\n=== Stage 1: JEPA pretraining '
-          f'({pretrain_epochs} epochs, loss = JEPA only) ===')
-    print(f'  stopgrad={PRETRAIN_STOPGRAD}  trains='
-          f'{"encoder only" if PRETRAIN_STOPGRAD else "encoder + decoder"}')
+    print(f'\n=== Stage 1: subsample-invariance pretraining '
+          f'({pretrain_epochs} epochs, loss = subsample only) ===')
+    print(f'  E(S_A) ~= {"sg(E(S_B))" if PRETRAIN_STOPGRAD else "E(S_B)"} | '
+          f'mode={SUBSAMPLE_LOSS} | n_views={N_VIEWS} | '
+          f'dynamic_constants={synth_train.dynamic_constants} | '
+          f'trains the encoder only')
 
     for pe in range(start_epoch, pretrain_epochs + 1):
         # Resume-invariant: depends only on (seed, pretrain epoch).
         es = stage1_epoch_seed(seed, pe)
         seed_everything(es)
         train_gen.manual_seed(es)
-        # Advances the augmentation. Under DETERMINISTIC_AUGMENTATION every
-        # realisation is a pure function of (seed, stage, epoch, idx), so this
-        # call is the ONLY thing that makes epoch N differ from epoch N-1 —
-        # without it every epoch replays epoch 0's coefficients and the
-        # augmentation silently does nothing. `stage` keeps Stage 1 and Stage 2
-        # from handing an example identical coefficients at the same epoch
-        # number.
-        synth_train.set_epoch(pe, stage='pretrain')
+
+        # Fresh, reproducible constants AND views for this epoch. Read
+        # inside __getitem__, so it must be set before the loader is iterated
+        # (workers fork here). Under DETERMINISTIC_AUGMENTATION this call is
+        # the ONLY thing that makes epoch N differ from epoch N-1.
+        if train_ds is not None:
+            train_ds.set_epoch(pe, stage='pretrain')
 
         model.train()
-        predictor.train()
         pre_sum = 0.0
         pre_n = 0
-        std_num_sum = std_sym_sum = 0.0
+        std_num_sum = 0.0
+        other_sum = 0.0
 
         pbar = tqdm(train_loader, leave=False,
                     desc=f'{paths["rel"]} P{pe}/{pretrain_epochs}')
         for batch in pbar:
-            points = batch['points'].to(DEVICE, non_blocking=True)
-            input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
-            attn_mask = batch['attn_mask'].to(DEVICE, non_blocking=True)
+            # (batch, n_views, view_points, d) — subsamples of ONE pool per
+            # equation, so the views are genuinely partial observations of the
+            # same function rather than independent full draws.
+            views = batch['points_views'].to(DEVICE, non_blocking=True)
 
             pre_opt.zero_grad()
             with amp_ctx():
+                z_views = [model.encoder(views[:, v]) for v in range(N_VIEWS)]
+
                 if PRETRAIN_STOPGRAD:
-                    # eval() first: no_grad blocks gradients but leaves dropout
-                    # active, which would make the "fixed" target move.
-                    model.eval()
-                    with torch.no_grad():
-                        z_sym = model.encode_expression(
-                            input_ids, attn_mask=attn_mask)
-                    model.train()
+                    # E(S_A) ~= sg(E(S_B)): view 0 carries the gradient, the
+                    # rest are fixed targets. Detaching is enough here — unlike
+                    # the token-JEPA target there is no dropout on this path to
+                    # make the "fixed" side move between the two encodes.
+                    z_in = [z_views[0]] + [z.detach() for z in z_views[1:]]
                 else:
-                    z_sym = model.encode_expression(
-                        input_ids, attn_mask=attn_mask)
-                z_num = model.encoder(points)
-                loss_pre = jepa_loss(predictor(z_num), z_sym, mode=JEPA_LOSS)
+                    z_in = z_views
+
+                loss_pre = subsample_consistency_loss(z_in, mode=SUBSAMPLE_LOSS)
+
+                with torch.no_grad():
+                    loss_other = subsample_consistency_loss(
+                        [z.detach() for z in z_views],
+                        mode=SUBSAMPLE_LOSS_OTHER)
 
             loss_pre.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
             pre_opt.step()
 
             pre_sum += loss_pre.item()
+            other_sum += loss_other.item()
             pre_n += 1
             # Averaged over the epoch, not read off the last batch: a per-batch
             # reading jitters with which equations land last and would mask a
-            # real collapse trend.
-            std_num_sum += z_num.detach().float().std(dim=0).mean().item()
-            std_sym_sum += z_sym.detach().float().std(dim=0).mean().item()
-            pbar.set_postfix({'jepa': f'{loss_pre.item():.4f}'})
+            # real collapse trend. std -> 0 is the collapse signature.
+            std_num_sum += z_views[0].detach().float().std(dim=0).mean().item()
+            pbar.set_postfix({'sub': f'{loss_pre.item():.4f}'})
         pbar.close()
         del pbar
 
         pre_avg = pre_sum / max(pre_n, 1)
+        other_avg = other_sum / max(pre_n, 1)
         std_num = std_num_sum / max(pre_n, 1)
-        std_sym = std_sym_sum / max(pre_n, 1)
-        history.setdefault('pretrain_jepa', []).append(pre_avg)
+        history.setdefault('pretrain_subsample', []).append(pre_avg)
+        history.setdefault('pretrain_subsample_other', []).append(other_avg)
         history.setdefault('pretrain_std_num', []).append(std_num)
-        history.setdefault('pretrain_std_sym', []).append(std_sym)
-        writer.add_scalar('pretrain/jepa_loss', pre_avg, pe)
+        writer.add_scalar('pretrain/subsample_loss', pre_avg, pe)
+        writer.add_scalar('pretrain/subsample_loss_other', other_avg, pe)
         writer.add_scalar('pretrain/std_z_num', std_num, pe)
-        writer.add_scalar('pretrain/std_z_sym', std_sym, pe)
-        print(f'  P{pe}/{pretrain_epochs} | jepa={pre_avg:.4f} | '
-              f'std(z_num)={std_num:.4f} std(z_sym)={std_sym:.4f}')
+        print(f'  P{pe}/{pretrain_epochs} | subsample={pre_avg:.4f} '
+              f'({SUBSAMPLE_LOSS_OTHER}={other_avg:.4f}) | '
+              f'std(z_num)={std_num:.4f}')
 
         pre_ck = {
             'model': model.state_dict(),
@@ -1210,9 +1110,6 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
             'history': {k: v for k, v in history.items()
                         if k.startswith('pretrain_')},
         }
-        if isinstance(predictor, JEPAPredictor):
-            pre_ck['predictor'] = predictor.state_dict()
-
         save_checkpoint_atomic(pre_ck, paths['pre_latest'], validate=validate,
                                label='pretrain/latest.pt')
         write_manifest(paths['manifest'], {
@@ -1249,29 +1146,25 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
 # TensorBoard, and `metrics.json`.
 
 # %%
-def validate_epoch(model, predictor, val_loader, repr_loader=None):
+def validate_epoch(model, predictor, val_loader, val_ds=None):
     """One full validation pass with token-weighted aggregation.
 
     Returns loss, ordinary token accuracy, branching-position accuracy, their
-    denominators, and the JEPA alignment diagnostics.
+    denominators, and the encoder view-consistency diagnostics.
 
-    Loss / accuracy / the JEPA term always use the FULL val_loader.  The
+    Loss and accuracy always use the FULL val_loader.  The
     `z_sym` / `z_pred` embeddings behind the representation diagnostics come
-    from *repr_loader*, a fixed deterministic subset — see
-    `make_repr_diag_loader`.  Passing None falls back to the first validation
-    batch, which is the old ~16-example behaviour and is far too noisy to read
-    a trend from.
+    from the FIXED diagnostic views of *val_ds* (see `view_consistency`),
+    not from whichever validation batch arrived first.  Passing None skips
+    them.
     """
     model.eval()
-    predictor.eval()
 
     val_loss_sum = 0.0
     val_tokens_total = 0
     acc_correct = acc_total = 0.0
     branch_correct = branch_total = 0.0
-    align_sum = 0.0
     n_batches = 0
-    diag_z_sym = diag_z_pred = None
 
     with torch.no_grad(), amp_ctx():
         for batch in val_loader:
@@ -1295,16 +1188,9 @@ def validate_epoch(model, predictor, val_loader, repr_loader=None):
             branch_correct += cb
             branch_total += tb
 
-            z_sym_v = model.encode_expression(input_ids, attn_mask=attn_mask)
-            z_pred_v = predictor(out['z_num'])
-            align_sum += jepa_loss(z_pred_v, z_sym_v, mode=JEPA_LOSS).item()
-            if diag_z_sym is None:
-                diag_z_sym, diag_z_pred = z_sym_v, z_pred_v
             n_batches += 1
 
-    if repr_loader is not None:
-        diag_z_sym, diag_z_pred = representation_embeddings(
-            model, predictor, repr_loader)
+    vc = view_consistency(model, val_ds) if val_ds is not None else {}
 
     return {
         'val': val_loss_sum / max(val_tokens_total, 1),
@@ -1312,10 +1198,7 @@ def validate_epoch(model, predictor, val_loader, repr_loader=None):
         'val_branch_acc': branch_correct / max(branch_total, 1),
         'n_tokens': val_tokens_total,
         'n_branch_tokens': int(branch_total),
-        'jepa': align_sum / max(n_batches, 1),
-        'z_sym': diag_z_sym,
-        'z_pred': diag_z_pred,
-        'n_repr': 0 if diag_z_sym is None else int(diag_z_sym.shape[0]),
+        'view_consistency': vc,
     }
 
 
@@ -1350,23 +1233,22 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 
     print(f'\n{"=" * 70}')
     print(f'{run_tag} | pretrain={pretrain_epochs}ep | '
-          f'finetune={FINETUNE_EPOCHS}ep | jepa_loss={JEPA_LOSS} | '
+          f'finetune={FINETUNE_EPOCHS}ep | subsample={SUBSAMPLE_LOSS} | '
           f'stopgrad={PRETRAIN_STOPGRAD} | {EXPERIMENT_VERSION}')
     print(f'{"=" * 70}')
 
     model, encoder, predictor = build_model()
-    params = list(model.parameters()) + list(predictor.parameters())
+    params = list(model.parameters())
 
     # Bind the augmentation stream to THIS run's seed, before any loader is
-    # built. Both pretrain arms at one seed therefore see the same realisation
-    # for the same (stage, epoch, idx), which is what keeps the comparison
-    # paired on the data as well as on the weights.
+    # built. Both pretrain arms at one seed then see the same realisation for
+    # the same (stage, epoch, idx), keeping the comparison paired on the data
+    # as well as on the weights.
     if DETERMINISTIC_AUGMENTATION:
         synth_train.constant_seed = seed
 
     train_loader, train_gen = make_train_loader(synth_train, seed)
     val_loader = make_eval_loader(synth_val)
-    repr_loader = make_repr_diag_loader(synth_val)
 
     optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1381,6 +1263,7 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
     best_val = float('inf')
     best_val_acc = 0.0
     best_val_branch_acc = 0.0
+    best_view_consistency = {}
     best_epoch = 0
     history = {'train': [], 'val': []}
 
@@ -1392,8 +1275,6 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
         model.load_state_dict(sup_ck['model'])
         optimizer.load_state_dict(sup_ck['optimizer'])
         scheduler.load_state_dict(sup_ck['scheduler'])
-        if 'predictor' in sup_ck and isinstance(predictor, JEPAPredictor):
-            predictor.load_state_dict(sup_ck['predictor'])
         start_epoch = sup_ck['epoch'] + 1
         best_val = sup_ck['best_val']
         best_val_acc = sup_ck.get('best_val_acc', 0.0)
@@ -1425,8 +1306,8 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
         writer = SummaryWriter(log_dir=str(paths['tb']))
 
     if writer is None:
-        del model, encoder, predictor, optimizer, scheduler
-        del train_loader, val_loader, repr_loader
+        del model, encoder, optimizer, scheduler
+        del train_loader, val_loader
         gc.collect()
         return
 
@@ -1434,7 +1315,8 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
     # Skipped on resume: the pretrained weights are already inside sup_ck.
     if sup_ck is None:
         run_pretraining(model, predictor, params, pretrain_epochs, seed,
-                        paths, writer, train_loader, train_gen, history)
+                        paths, writer, train_loader, train_gen, history,
+                        train_ds=synth_train)
         optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=FINETUNE_EPOCHS)
@@ -1469,17 +1351,15 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
         es = stage2_epoch_seed(seed, epoch)
         seed_everything(es)
         train_gen.manual_seed(es)
-        # Advances the augmentation. Under DETERMINISTIC_AUGMENTATION every
-        # realisation is a pure function of (seed, stage, epoch, idx), so this
-        # call is the ONLY thing that makes epoch N differ from epoch N-1 —
-        # without it every epoch replays epoch 0's coefficients and the
-        # augmentation silently does nothing. `stage` keeps Stage 1 and Stage 2
-        # from handing an example identical coefficients at the same epoch
-        # number.
+        # Stage 2 consumes view 0 of the multi-view dataset. Its constants
+        # and clouds are a pure function of (seed, 'supervised', epoch, idx) —
+        # no worker RNG is involved — so both pretraining arms see
+        # BIT-IDENTICAL Stage-2 data by construction, a stronger guarantee
+        # than the loader rebuild alone. The 'supervised' stage tag is what
+        # keeps these off the clouds Stage 1 pretrained on.
         synth_train.set_epoch(epoch, stage='supervised')
 
         model.train()
-        predictor.train()
         train_loss_gen = 0.0
         n_batches = 0
 
@@ -1499,7 +1379,6 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
             optimizer.step()
 
             train_loss_gen += loss.item()
@@ -1518,34 +1397,27 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 
         is_best = False
         if epoch % VAL_EVERY == 0 or epoch == FINETUNE_EPOCHS:
-            v = validate_epoch(model, predictor, val_loader, repr_loader)
+            v = validate_epoch(model, predictor, val_loader, synth_val)
             history['val'].append(v['val'])
             history.setdefault('val_acc', []).append(v['val_acc'])
             history.setdefault('val_branch_acc', []).append(v['val_branch_acc'])
-            history.setdefault('val_jepa_raw', []).append(v['jepa'])
 
             writer.add_scalar('val/loss', v['val'], epoch)
             writer.add_scalar('val/token_accuracy', v['val_acc'], epoch)
             writer.add_scalar('val/token_accuracy_branching',
                               v['val_branch_acc'], epoch)
-            writer.add_scalar('val/jepa_raw', v['jepa'], epoch)
 
-            ss = sym_spread(v['z_sym'])
-            ps = pred_spread(v['z_pred'])
-            rt = retrieval_top1(v['z_pred'], v['z_sym'])
-            cm = common_mode(v['z_sym'])
-            writer.add_scalar('val/sym_spread_raw', ss['raw'], epoch)
-            writer.add_scalar('val/sym_spread_cent', ss['centered'], epoch)
-            writer.add_scalar('val/pred_spread', ps['raw'], epoch)
-            writer.add_scalar('val/retrieval_top1', rt['centered'], epoch)
-            writer.add_scalar('val/common_mode_ratio',
-                              cm['mean_norm_ratio'], epoch)
+            vc = v['view_consistency']
+            for _k, _val in vc.items():
+                writer.add_scalar(f'val/{_k}', _val, epoch)
+                history.setdefault(f'val_{_k}', []).append(_val)
 
             is_best = v['val'] < best_val
             if is_best:
                 best_val = v['val']
                 best_val_acc = v['val_acc']
                 best_val_branch_acc = v['val_branch_acc']
+                best_view_consistency = vc
                 best_epoch = epoch
 
             if SYMBOLIC_EVAL_EVERY and (
@@ -1566,7 +1438,7 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
                   f'acc={v["val_acc"] * 100:.1f}% | '
                   f'branch_acc={v["val_branch_acc"] * 100:.1f}% '
                   f'(n={v["n_branch_tokens"]}) | '
-                  f'jepa={v["jepa"]:.4f} | retr={rt["centered"]:.2f}')
+                  f'gap_c={vc.get("gap_centered", float("nan")):.4f}')
 
             if is_best:
                 # best.pt is the authoritative best-model weight snapshot and
@@ -1593,14 +1465,12 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
             'best_val': best_val,
             'best_val_acc': best_val_acc,
             'best_val_branch_acc': best_val_branch_acc,
+            'best_view_consistency': best_view_consistency,
             'best_epoch': best_epoch,
             'history': history,
             'seed': seed,
             'run_config': sup_cfg,
         }
-        if isinstance(predictor, JEPAPredictor):
-            ckpt['predictor'] = predictor.state_dict()
-
         save_checkpoint_atomic(ckpt, paths['sup_latest'],
                                validate=latest_validate,
                                label='supervised/latest.pt')
@@ -1615,6 +1485,7 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
             'best_val': best_val if np.isfinite(best_val) else None,
             'best_val_acc': best_val_acc,
             'best_val_branch_acc': best_val_branch_acc,
+            'best_view_consistency': best_view_consistency,
             'run_config': sup_cfg,
         })
 
@@ -1631,8 +1502,8 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
                               paths['manifest'], verbose=False)
 
     writer.close()
-    del train_loader, val_loader, repr_loader
-    del model, encoder, predictor, optimizer, scheduler
+    del train_loader, val_loader
+    del model, encoder, optimizer, scheduler
     if DEVICE == 'cuda':
         torch.cuda.empty_cache()
     gc.collect()
@@ -1730,6 +1601,9 @@ def eval_one(pretrain_epochs, seed, synth_test):
         'best_val_loss': latest_ck['best_val'],
         'best_val_acc': latest_ck.get('best_val_acc', 0.0),
         'best_val_branch_acc': latest_ck.get('best_val_branch_acc', 0.0),
+        # Encoder view-consistency at the best epoch: the direct read on what
+        # Stage 1 was optimising. gap_centered is the headline.
+        'best_view_consistency': latest_ck.get('best_view_consistency', {}),
         'greedy_exact_match': results['exact_match'],
         'greedy_token_acc': results['token_accuracy'],
         'greedy_algebraic_equiv': results['algebraic_equiv'],
@@ -1762,9 +1636,8 @@ def eval_one(pretrain_epochs, seed, synth_test):
 # The next cell launches the configured multi-seed experiment
 # (`PRETRAIN_EPOCHS_VALUES × SEEDS` = 6 runs at the defaults) and can run for
 # hours. All active checkpoints are written to the local
-# `/content/symbolic_jepa_checkpoints/jepa_pretrain_v2_vocab40_matched_l8` root
-# and copied to Drive separately; a Drive failure prints a warning and training
-# continues.
+# `/content/symbolic_jepa_checkpoints/jepa_pretrain_v2` root and copied to
+# Drive separately; a Drive failure prints a warning and training continues.
 #
 # Nothing above this cell starts training.
 
@@ -1820,7 +1693,8 @@ print(f'\n{"=" * 78}')
 print(f'{EXPERIMENT_VERSION} — n_test={len(synth_test)}')
 print(f'{"=" * 78}')
 print(f'\n{"pre_ep":>7} {"seed":>6} {"val_loss":>10} {"val_acc":>9} '
-      f'{"val_branch":>11} {"exact":>8} {"equiv":>8} {"R²>.9":>8}')
+      f'{"val_branch":>11} {"exact":>8} {"equiv":>8} {"R²>.9":>8} '
+      f'{"gap_c":>8}')
 print('-' * 78)
 for _m in successful_metrics:
     print(f'{_m["pretrain_epochs"]:>7} {_m["seed"]:>6} '
@@ -1829,17 +1703,19 @@ for _m in successful_metrics:
           f'{_m["best_val_branch_acc"] * 100:>10.1f}% '
           f'{_m["greedy_exact_match"] * 100:>7.1f}% '
           f'{_m["greedy_algebraic_equiv"] * 100:>7.1f}% '
-          f'{_m["greedy_r2_above_0.9"] * 100:>7.1f}%')
+          f'{_m["greedy_r2_above_0.9"] * 100:>7.1f}% '
+          f'{_m.get("best_view_consistency", {}).get("gap_centered", float("nan")):>8.4f}')
 
 print(f'\n{"pre_ep":>7} {"avg_exact":>10} {"avg_equiv":>10} {"avg_R²>.9":>10} '
-      f'{"avg_val_acc":>12} {"avg_branch":>11} {"n_ok":>6} {"n_fail":>7}')
+      f'{"avg_val_acc":>12} {"avg_branch":>11} {"avg_gap_c":>11} '
+      f'{"n_ok":>6} {"n_fail":>7}')
 print('-' * 78)
 for _pe in PRETRAIN_EPOCHS_VALUES:
     _runs = [m for m in successful_metrics if m['pretrain_epochs'] == _pe]
     _nf = sum(1 for f in failed_runs if f['pretrain_epochs'] == _pe)
     if not _runs:
         print(f'{_pe:>7} {"—":>10} {"—":>10} {"—":>10} {"—":>12} {"—":>11} '
-              f'{0:>6} {_nf:>7}')
+              f'{"—":>11} {0:>6} {_nf:>7}')
         continue
     print(f'{_pe:>7} '
           f'{np.mean([m["greedy_exact_match"] for m in _runs]) * 100:>9.1f}% '
@@ -1847,6 +1723,7 @@ for _pe in PRETRAIN_EPOCHS_VALUES:
           f'{np.mean([m["greedy_r2_above_0.9"] for m in _runs]) * 100:>9.1f}% '
           f'{np.mean([m["best_val_acc"] for m in _runs]) * 100:>11.1f}% '
           f'{np.mean([m["best_val_branch_acc"] for m in _runs]) * 100:>10.1f}% '
+          f'{np.mean([m.get("best_view_consistency", {}).get("gap_centered", float("nan")) for m in _runs]):>11.4f} '
           f'{len(_runs):>6} {_nf:>7}')
 
 if failed_runs:
@@ -1884,7 +1761,7 @@ def load_history(pretrain_epochs, seed):
         return json.load(f)
 
 
-_fig, _ax = plt.subplots(1, 4, figsize=(20, 4))
+_fig, _ax = plt.subplots(1, 6, figsize=(30, 4))
 _cmap = plt.get_cmap('viridis')
 _col = {p: _cmap(i / max(len(PRETRAIN_EPOCHS_VALUES) - 1, 1))
         for i, p in enumerate(PRETRAIN_EPOCHS_VALUES)}
@@ -1896,7 +1773,9 @@ for _p in PRETRAIN_EPOCHS_VALUES:
             continue
         _lbl = f'pre{_p} s={_s}' + (' (baseline)' if _p == 0 else '')
         for _i, _key, _scale in ((0, 'train', 1), (1, 'val', 1),
-                                 (2, 'val_acc', 100), (3, 'val_branch_acc', 100)):
+                                 (2, 'val_acc', 100), (3, 'val_branch_acc', 100),
+                                 (4, 'val_gap_centered', 1),
+                                 (5, 'pretrain_subsample', 1)):
             _series = _h.get(_key) or []
             if _series:
                 _ax[_i].plot(range(1, len(_series) + 1),
@@ -1904,9 +1783,11 @@ for _p in PRETRAIN_EPOCHS_VALUES:
                              color=_col[_p], alpha=.6, label=_lbl)
 
 for _i, _title in enumerate(['Stage 2: train CE', 'Stage 2: val loss',
-                             'val token acc %', 'val BRANCHING acc %']):
+                             'val token acc %', 'val BRANCHING acc %',
+                             'same - diff cosine (centered)',
+                             'Stage 1: subsample loss']):
     _ax[_i].set_title(_title)
-    _ax[_i].set_xlabel('finetune epoch')
+    _ax[_i].set_xlabel('pretrain epoch' if _i == 5 else 'finetune epoch')
     _ax[_i].grid(alpha=.3)
     _ax[_i].legend(fontsize=6)
 plt.tight_layout()
@@ -1970,31 +1851,20 @@ for _p in PRETRAIN_EPOCHS_VALUES:
     inspect_run(_p, SEEDS[0], n_show=10)
 
 # %% [markdown]
-# ## 12. Does JEPA solve a SUPERSET of the baseline, or a different set?
+# ## Does pretraining solve a SUPERSET of the baseline, or a different set?
 #
-# The aggregate gap cannot tell these apart. `pretrain_0` at 35.4% and
-# `pretrain_10` at 36.1% is consistent with
-#
-# * **nested** — pretraining solves everything the baseline solves plus ~25
-#   more. A clean capability gain.
-# * **rotated** — the two arms solve substantially different sets of similar
-#   size, and +0.7 pp is the small residue of a much larger churn. Then the
-#   headline understates the run-to-run variance and the paired mean is a
-#   misleading summary.
-#
-# Only the **discordant** examples carry information about which arm is
-# better, which is exactly McNemar's test. This reads the per-example
-# `details` already stored in every `metrics.json` — nothing is re-run.
-#
-# `churn` is the number of examples that changed answer per unit of net gain.
-# 1.0 is a pure addition; 5.0 means five examples moved to gain one.
+# The aggregate gap cannot tell a **nested** gain (everything the baseline
+# solves, plus more) from a **rotation** (different sets of similar size, with
+# the headline being the residue of a much larger churn). Only the discordant
+# examples carry information, which is McNemar's test. Reads the per-example
+# `details` already in every `metrics.json` — nothing is re-run.
 
 # %%
 _matrix = load_run_matrix(LOCAL_CHECKPOINT_ROOT, PRETRAIN_EPOCHS_VALUES, SEEDS)
+_lo, _hi = min(PRETRAIN_EPOCHS_VALUES), max(PRETRAIN_EPOCHS_VALUES)
 
 AGREEMENT = {}
 for _metric in ('equiv', 'r2>0.9', 'exact'):
-    _lo, _hi = min(PRETRAIN_EPOCHS_VALUES), max(PRETRAIN_EPOCHS_VALUES)
     if not (_matrix.get(_lo) and _matrix.get(_hi)):
         print(f'skipping {_metric}: need both arms evaluated')
         continue
@@ -2004,55 +1874,25 @@ for _metric in ('equiv', 'r2>0.9', 'exact'):
     print('\n' + '=' * 78 + '\n')
 
 # %% [markdown]
-# ### Where do the gains sit?
-#
-# A gain concentrated on short expressions means something different from one
-# spread evenly: the first is the model getting easy structures right, the
-# second a broad improvement.
-
-# %%
-from symbolic_jepa.agreement import stratified_agreement  # noqa: E402
-
-_lo, _hi = min(PRETRAIN_EPOCHS_VALUES), max(PRETRAIN_EPOCHS_VALUES)
-if _matrix.get(_lo) and _matrix.get(_hi):
-    _shared = sorted(set(_matrix[_lo]) & set(_matrix[_hi]))
-    _rows = {}
-    for _s in _shared:
-        for _band, _v in stratified_agreement(
-                _matrix[_lo][_s], _matrix[_hi][_s], metric='equiv').items():
-            _acc = _rows.setdefault(_band, {k: 0 for k in _v})
-            for _k, _n in _v.items():
-                _acc[_k] += _n
-    print(f'{"gt tokens":>12}{"n":>8}{"base":>8}{"jepa":>8}'
-          f'{"only_base":>11}{"only_jepa":>11}{"net":>7}')
-    for _band, _v in _rows.items():
-        print(f'{_band:>12}{_v["n"]:>8}{_v["a_correct"]:>8}{_v["b_correct"]:>8}'
-              f'{_v["only_a"]:>11}{_v["only_b"]:>11}'
-              f'{_v["only_b"] - _v["only_a"]:>+7d}')
-
-# %% [markdown]
-# ## 13. Does the advantage grow, shrink, or appear late?
+# ## Does the advantage grow, shrink, or appear late?
 #
 # `SYMBOLIC_EVAL_EVERY` records `equiv` and `R2>0.9` on a fixed validation
-# prefix during training, so the effect can be read as a trajectory rather
-# than one end-of-run number. A gap that is already present at epoch 5 and
-# constant afterwards means something different from one that only opens up
-# late.
+# prefix during training, so the effect is a trajectory rather than one
+# end-of-run number.
 
 # %%
 _have_sym = any('sym_equiv' in (load_history(_p, _s) or {})
                 for _p in PRETRAIN_EPOCHS_VALUES for _s in SEEDS)
 
 if not _have_sym:
-    print('No mid-training symbolic history found — this needs a run with '
+    print('No mid-training symbolic history — needs a run with '
           'SYMBOLIC_EVAL_EVERY > 0.')
 else:
     _fig, _axes = plt.subplots(1, 2, figsize=(13, 4.5))
     for _ax, _key, _label in ((_axes[0], 'sym_equiv', 'algebraic equivalence'),
                               (_axes[1], 'sym_r2_above_0.9', 'R² > 0.9')):
         for _p in PRETRAIN_EPOCHS_VALUES:
-            _curves = []
-            _ep = None
+            _curves, _ep = [], None
             for _s in SEEDS:
                 _h = load_history(_p, _s)
                 if not _h or _key not in _h:
@@ -2064,14 +1904,14 @@ else:
             _n = min(len(c) for c in _curves)
             _arr = np.array([c[:_n] for c in _curves])
             _mean = _arr.mean(axis=0) * 100
-            _se = _arr.std(axis=0, ddof=1) / np.sqrt(len(_arr)) * 100 \
-                if len(_arr) > 1 else np.zeros(_n)
+            _se = (_arr.std(axis=0, ddof=1) / np.sqrt(len(_arr)) * 100
+                   if len(_arr) > 1 else np.zeros(_n))
             _x = (_ep or list(range(1, _n + 1)))[:_n]
             _ax.plot(_x, _mean, marker='o', label=f'pretrain_{_p}')
             _ax.fill_between(_x, _mean - _se, _mean + _se, alpha=0.2)
         _ax.set_xlabel('epoch')
         _ax.set_ylabel(f'{_label} (%)')
-        _ax.set_title(f'{_label} over training (mean ± s.e., n={len(SEEDS)})')
+        _ax.set_title(f'{_label} over training (mean ± s.e.)')
         _ax.legend()
         _ax.grid(alpha=0.3)
     plt.tight_layout()

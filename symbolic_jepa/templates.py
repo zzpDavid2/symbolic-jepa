@@ -60,6 +60,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 import sympy as sp
+import torch
 
 from symbolic_jepa.dataset import (
     _maybe_tqdm,
@@ -81,12 +82,16 @@ from symbolic_jepa.tokenizer import (
 )
 
 __all__ = [
+    'AUGMENTATION_VERSION',
+    'augmentation_seed',
     'ConstantTemplate',
     'ConstantSampler',
     'DynamicConstantPointCloudDataset',
+    'DynamicConstantMultiViewDataset',
     'InstantiatedExpression',
     'TEMPLATE_FORMAT',
     'audit_constant_sampling',
+    'build_multiview_template_splits',
     'build_template_splits',
     'build_templates_from_strings',
     'canonical_split_report',
@@ -94,10 +99,34 @@ __all__ = [
     'load_template_dataset',
     'pool_is_usable',
     'save_template_dataset',
+    'templates_fingerprint',
     'templatize',
 ]
 
 TEMPLATE_FORMAT = 'symbolic_jepa.templates/v1'
+
+# Bump when the mapping from (base_seed, stage, epoch, idx) to a realisation
+# changes.  Stored in the checkpoint so a resume cannot silently continue under
+# different augmentation than the epochs already trained.
+AUGMENTATION_VERSION = 'stateless-v1'
+
+
+def augmentation_seed(base_seed: int, stage, epoch: int, idx: int,
+                      stream: str, attempt: int = 0) -> int:
+    """Stable 32-bit seed for one (stage, epoch, example, stream, attempt).
+
+    SHA-256 rather than Python's ``hash()``, which is randomised per process for
+    strings and would make every fresh runtime a different experiment.
+
+    *stream* separates concerns that must not perturb each other.  Constant
+    sampling and point sampling draw from independent streams, so changing how
+    many random values a coefficient draw consumes — which happens as soon as a
+    form's slot count changes — cannot shift the point cloud.  *attempt* does
+    the same across rejection retries: retry *k* is a fixed function of *k*, not
+    of how much entropy attempts ``0..k-1`` happened to burn.
+    """
+    key = f'{base_seed}|{stage}|{epoch}|{idx}|{stream}|{attempt}'.encode()
+    return int.from_bytes(hashlib.sha256(key).digest()[:4], 'big')
 
 
 # ============================================================================
@@ -708,6 +737,28 @@ def save_template_dataset(path, templates: Sequence[ConstantTemplate],
     return path
 
 
+def templates_fingerprint(templates: Sequence[ConstantTemplate]) -> str:
+    """Short stable hash of a template list's identity and order.
+
+    Stored in each checkpoint so a resume cannot silently continue against a
+    different canonical-template dataset — a rebuilt file with a different
+    ``--max-expressions`` would change both the forms and the split, and the
+    weights would load without complaint.
+
+    Covers the canonical prefixes (which fix the decoder targets), their order
+    (which fixes the split), and each form's reference coefficients (which fix
+    the val/test point clouds).
+    """
+    h = hashlib.sha256()
+    for t in templates:
+        h.update(t.prefix.encode())
+        h.update(b'\0')
+        h.update(np.asarray(t.reference_constants, dtype=np.float64).tobytes())
+        h.update(b'\n')
+    h.update(str(len(templates)).encode())
+    return h.hexdigest()[:16]
+
+
 def load_template_dataset(path, tokenizer: Optional[PrefixTokenizer] = None,
                           max_templates: int = 0
                           ) -> tuple[list[ConstantTemplate], dict]:
@@ -831,6 +882,7 @@ class DynamicConstantPointCloudDataset(PointCloudDataset):
         self.pool_mult = int(pool_mult)
         self.max_abs = float(max_abs)
         self.epoch = 0
+        self.stage = None
 
         # Per-process counters.  With num_workers > 0 each worker keeps its own
         # copy and the parent's stay at zero — use audit_constant_sampling for
@@ -851,59 +903,186 @@ class DynamicConstantPointCloudDataset(PointCloudDataset):
     def unique_canonical_count(self) -> int:
         return len(set(self.canonical_forms))
 
-    def _constant_rng(self, idx: int):
+    # --- Deterministic augmentation state ---
+
+    @property
+    def deterministic_augmentation(self) -> bool:
+        """Whether realisations are a pure function of (seed, stage, epoch, idx).
+
+        True exactly when ``constant_seed`` is set.  With it unset the dataset
+        draws from the global NumPy RNG, which is worker- and history-dependent
+        and therefore not reproducible across a resume.
+        """
+        return self.constant_seed is not None
+
+    def set_epoch(self, epoch: int, stage=None) -> 'DynamicConstantPointCloudDataset':
+        """Point the augmentation at *epoch* (and optionally a training stage).
+
+        Call before each epoch.  Under deterministic augmentation this is what
+        advances the realisations — without it every epoch replays the same
+        coefficients.  *stage* keeps Stage 1 and Stage 2 from handing the same
+        example identical coefficients at the same epoch number.
+        """
+        self.epoch = int(epoch)
+        if stage is not None:
+            self.stage = stage
+        return self
+
+    def _stream_rngs(self, idx: int, attempt: int, fallback):
+        """``(constants_rng, points_rng, subsample_rng)`` for one attempt.
+
+        Returns *fallback* three times when ``constant_seed`` is None, which
+        preserves the original single-stream stochastic behaviour exactly.
+        """
         if self.constant_seed is None:
-            return None
-        key = f'{self.constant_seed}|{self.epoch}|{idx}'.encode()
-        seed = int.from_bytes(hashlib.sha256(key).digest()[:4], 'big')
-        return np.random.RandomState(seed)
+            return fallback, fallback, fallback
+        return tuple(
+            np.random.RandomState(augmentation_seed(
+                self.constant_seed, self.stage, self.epoch, idx,
+                stream, attempt))
+            for stream in ('constants', 'points', 'subsample')
+        )
 
     def draw_realization(self, idx: int, rng=None):
         """Sample coefficients for *idx* and return a validated point pool.
 
-        Returns ``(pool, expr, n_rejected, used_fallback)``.
+        Returns ``(pool, expr, n_rejected, used_fallback, subsample_rng)``.
         """
         s = self.samples[idx]
         tmpl = s['template']
         n_points = self.n_points * self.pool_mult
         rejected = 0
+        sub_rng = rng
 
-        for _ in range(self.max_constant_tries):
-            values = self.sampler.sample(tmpl, rng)
+        for attempt in range(self.max_constant_tries):
+            c_rng, p_rng, sub_rng = self._stream_rngs(idx, attempt, rng)
+            values = self.sampler.sample(tmpl, c_rng)
             expr = tmpl.instantiate(values)
             try:
-                pool = sample_pool(expr, n_points, rng=rng)
+                # Overflow and invalid operations are EXPECTED here and are
+                # already handled: a candidate that blows up is precisely what
+                # the finite filter and `pool_is_usable` reject and redraw.
+                # Left un-suppressed, NumPy warns once per lambdified template
+                # per first offending draw — and because whether a template
+                # overflows depends on the coefficients drawn, fresh warnings
+                # keep appearing every epoch, burying warnings that matter.
+                # Scoped to candidate evaluation only, so an overflow in
+                # val/test or in scoring still surfaces.
+                with np.errstate(over='ignore', invalid='ignore',
+                                 divide='ignore'):
+                    pool = sample_pool(expr, n_points, rng=p_rng)
             except RuntimeError:
                 rejected += 1
                 continue
             if not pool_is_usable(pool, max_abs=self.max_abs):
                 rejected += 1
                 continue
-            return pool, expr, rejected, False
+            return pool, expr, rejected, False, sub_rng
 
         # Every draw was pathological.  The reference realisation came from the
         # generator and already passed the construction probe, so it always
         # yields a usable cloud — the example degrades to baseline behaviour
         # instead of raising inside a DataLoader worker.
         expr = s['expr']
-        return sample_pool(expr, n_points, rng=rng), expr, rejected, True
+        _c, p_rng, sub_rng = self._stream_rngs(idx, self.max_constant_tries, rng)
+        return sample_pool(expr, n_points, rng=p_rng), expr, rejected, True, sub_rng
 
     def __getitem__(self, idx):
         if not self.dynamic_constants:
             return super().__getitem__(idx)
 
         s = self.samples[idx]
-        rng = self._constant_rng(idx)
-        pool, _expr, rejected, fallback = self.draw_realization(idx, rng=rng)
+        # None under deterministic augmentation: every stream is derived from
+        # (constant_seed, stage, epoch, idx) instead, so nothing depends on
+        # mutable global RNG state inside a worker.
+        rng = None
+        pool, _expr, rejected, fallback, sub_rng = self.draw_realization(
+            idx, rng=rng)
 
         self.n_constant_draws += 1
         self.n_constant_rejections += rejected
         self.n_constant_fallbacks += int(fallback)
 
         points = subsample_and_normalize(
-            pool, self.n_points, self.target_d, rng=rng, random_subsample=True)
+            pool, self.n_points, self.target_d, rng=sub_rng,
+            random_subsample=True)
         return {
             'points': points,
+            'input_ids': s['input_ids'],
+            'attn_mask': s['attn_mask'],
+        }
+
+
+class DynamicConstantMultiViewDataset(DynamicConstantPointCloudDataset):
+    """*n_views* subsamples of ONE dynamically-instantiated function.
+
+    Subsample-JEPA trains the encoder to map different partial observations of
+    the same function to the same latent.  Coefficients are therefore drawn
+    **once per item and shared by every view**: the views must differ in which
+    points were observed, not in which function was observed, or the
+    consistency objective is being trained against a premise that is false.
+
+    Composes with dynamic constants exactly as expected — each epoch the item
+    is a new function, and the views are a new partial look at it:
+
+    .. code-block:: text
+
+        sample constants  ->  one function
+              |
+              +-- pool of n_points * pool_mult points
+                    |
+                    +-- view 0 : view_points rows
+                    +-- view 1 : view_points rows      (same function)
+
+    Every view's subsample draws from its own deterministic stream, so adding a
+    view cannot shift the others.
+    """
+
+    def __init__(
+        self,
+        templates: Sequence[ConstantTemplate],
+        tokenizer: PrefixTokenizer,
+        *,
+        n_views: int = 2,
+        view_points: Optional[int] = None,
+        pool_mult: int = 4,
+        **kwargs,
+    ):
+        super().__init__(templates, tokenizer, pool_mult=pool_mult, **kwargs)
+        self.n_views = int(n_views)
+        self.view_points = int(view_points or self.n_points)
+
+    def _view_rng(self, idx: int, view: int):
+        if self.constant_seed is None:
+            return None
+        return np.random.RandomState(augmentation_seed(
+            self.constant_seed, self.stage, self.epoch, idx, f'view{view}'))
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+
+        if self.dynamic_constants:
+            pool, _expr, rejected, fallback, _sub = self.draw_realization(idx)
+            self.n_constant_draws += 1
+            self.n_constant_rejections += rejected
+            self.n_constant_fallbacks += int(fallback)
+        else:
+            # Static control: the reference realisation, still multi-view.
+            _c, p_rng, _s = self._stream_rngs(idx, 0, None)
+            pool = sample_pool(s['expr'], self.n_points * self.pool_mult,
+                               rng=p_rng)
+
+        views = [
+            subsample_and_normalize(
+                pool, self.view_points, self.target_d,
+                rng=self._view_rng(idx, v), random_subsample=True)
+            for v in range(self.n_views)
+        ]
+        return {
+            # (n_views, view_points, target_d)
+            'points_views': torch.stack(views),
+            # view 0 under the standard key, so single-view code still works
+            'points': views[0],
             'input_ids': s['input_ids'],
             'attn_mask': s['attn_mask'],
         }
@@ -1039,6 +1218,80 @@ def build_template_splits(
     return datasets['train'], datasets['val'], datasets['test']
 
 
+def build_multiview_template_splits(
+    templates: Sequence[ConstantTemplate],
+    tokenizer: PrefixTokenizer,
+    n_points: int = 1000,
+    max_seq_len: int = 64,
+    max_vars: int = 9,
+    seed: int = 42,
+    train_frac: float = 0.8,
+    val_frac: float = 0.1,
+    n_views: int = 2,
+    view_points: Optional[int] = None,
+    pool_mult: int = 4,
+    dynamic_constants: bool = True,
+    sampler: Optional[ConstantSampler] = None,
+    constant_seed: Optional[int] = None,
+    max_constant_tries: int = 8,
+    max_abs: float = 1e6,
+    cache_eval: bool = False,
+    group_by_tokens: bool = True,
+    progress: bool = False,
+) -> tuple[DynamicConstantMultiViewDataset,
+           DynamicConstantPointCloudDataset,
+           DynamicConstantPointCloudDataset]:
+    """Multi-view training split, deterministic single-view val/test.
+
+    Uses the same ``_split_indices`` call as :func:`build_template_splits` and
+    :func:`build_synthetic_splits`, so at a given *seed* the partition matches
+    the single-view and pre-template runs exactly and results stay comparable.
+
+    Returns:
+        ``(train_ds, val_ds, test_ds)``
+    """
+    groups = (_canonical_groups(templates, tokenizer, progress=progress)
+              if group_by_tokens else None)
+    splits = _split_indices(
+        len(templates), seed, train_frac, val_frac, groups=groups)
+
+    if sampler is not None and dynamic_constants and not sampler.is_fitted:
+        sampler.fit([templates[i] for i in splits['train']])
+        print(f'constant sampler fitted on {len(splits["train"])} train '
+              f'forms: {sampler.describe()}')
+
+    train_ds = DynamicConstantMultiViewDataset(
+        [templates[i] for i in splits['train']], tokenizer,
+        n_views=n_views, view_points=view_points, pool_mult=pool_mult,
+        dynamic_constants=dynamic_constants, sampler=sampler,
+        constant_seed=constant_seed, max_constant_tries=max_constant_tries,
+        max_abs=max_abs,
+        n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
+        resample=True,
+        progress='train point clouds' if progress else False,
+    )
+    print(f'Templates train: {len(train_ds)} forms '
+          f'({train_ds.unique_canonical_count()} unique canonical, '
+          f'{n_views} views each, '
+          f'{"dynamic" if train_ds.dynamic_constants else "fixed"} constants)')
+
+    datasets = {'train': train_ds}
+    for name in ('val', 'test'):
+        datasets[name] = DynamicConstantPointCloudDataset(
+            [templates[i] for i in splits[name]], tokenizer,
+            dynamic_constants=False, sampler=sampler, constant_seed=None,
+            n_points=n_points, max_seq_len=max_seq_len, max_vars=max_vars,
+            resample=False, cache=cache_eval,
+            progress=f'{name} point clouds' if progress else False,
+        )
+        print(f'Templates {name}: {len(datasets[name])} forms '
+              f'({datasets[name].unique_canonical_count()} unique canonical, '
+              f'fixed constants)')
+
+    _report_leakage(datasets)
+    return train_ds, datasets['val'], datasets['test']
+
+
 # ============================================================================
 # Diagnostics
 # ============================================================================
@@ -1112,7 +1365,7 @@ def audit_constant_sampling(dataset: DynamicConstantPointCloudDataset,
     n_rejected = 0
     n_fallback = 0
     for idx in idxs:
-        _pool, _expr, rejected, fallback = dataset.draw_realization(
+        _pool, _expr, rejected, fallback, _sub = dataset.draw_realization(
             int(idx), rng=rng)
         n_rejected += rejected
         n_fallback += int(fallback)

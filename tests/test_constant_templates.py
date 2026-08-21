@@ -14,6 +14,7 @@ that turning the feature off reproduces the old pipeline exactly.
 
 import math
 import pickle
+import warnings
 
 import numpy as np
 import pytest
@@ -570,6 +571,33 @@ def test_dynamic_clouds_are_finite_and_non_degenerate(templates, tokenizer):
                 assert float(points[:, 1].std()) > 1e-3, f'{ds} sample {i}'
 
 
+def test_overflowing_draws_do_not_leak_numpy_warnings(univariate, tokenizer):
+    """A blown-up candidate is rejected quietly, not narrated to the log.
+
+    `A*sinh(b*x)*exp(-a*x**2)` overflows for large `b`, and a resampled `b` will
+    occasionally be large. That draw is rejected and redrawn — correct — but
+    NumPy would warn once per lambdified template per first offending draw, and
+    since whether a template overflows depends on the coefficients drawn, the
+    warnings keep arriving every epoch for 30 epochs.
+    """
+    expr = Expression.from_infix('1.5*sinh(0.4*x)*exp(-0.2*x**2)', univariate)
+    tmpl = ConstantTemplate.from_expression(expr)
+
+    # A pool that guarantees overflow: sinh(300*pi) is far past float64 range.
+    sampler = ConstantSampler(mode='global', magnitude_pool=np.array([300.0]))
+    ds = DynamicConstantPointCloudDataset(
+        [tmpl], tokenizer, n_points=64, max_vars=1,
+        dynamic_constants=True, sampler=sampler, max_constant_tries=3)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        np.random.seed(0)
+        item = ds[0]
+
+    assert torch.isfinite(item['points']).all()
+    assert ds.n_constant_fallbacks == 1, 'every draw should have been rejected'
+
+
 def test_pool_is_usable_rejects_pathologies():
     x = np.linspace(-1, 1, 100).reshape(-1, 1)
 
@@ -631,3 +659,76 @@ def test_load_rejects_a_mismatched_vocabulary(templates, tokenizer, tmp_path):
     other.extend(['my_concept_token'])
     with pytest.raises(ValueError, match='different tokenizer vocabulary'):
         load_template_dataset(path, other)
+
+
+# ---------------------------------------------------------------------------
+# Multi-view: several partial observations of ONE realisation
+# ---------------------------------------------------------------------------
+
+def test_multiview_shares_one_function_across_views(templates, tokenizer):
+    """Views must differ in points observed, not in which function was drawn.
+
+    Subsample-JEPA asks the encoder to map partial observations of the *same*
+    function to the same latent. Drawing fresh constants per view would train
+    that objective against a premise that is false.
+    """
+    from symbolic_jepa.templates import DynamicConstantMultiViewDataset
+
+    ds = DynamicConstantMultiViewDataset(
+        templates, tokenizer, n_points=64, max_vars=1, n_views=3,
+        pool_mult=4, dynamic_constants=True,
+        sampler=ConstantSampler().fit(templates), constant_seed=42)
+    ds.set_epoch(3, stage='pretrain')
+
+    item = ds[0]
+    assert item['points_views'].shape == (3, 64, ds.target_d)
+    assert torch.equal(item['points'], item['points_views'][0])
+    assert torch.isfinite(item['points_views']).all()
+
+    # Views are distinct subsamples...
+    for a in range(3):
+        for b in range(a + 1, 3):
+            assert not torch.equal(item['points_views'][a],
+                                   item['points_views'][b])
+
+    # ...but of one function: the constants drawn for this (epoch, idx) are a
+    # single vector, so re-deriving them reproduces every view exactly.
+    again = ds[0]
+    assert torch.equal(item['points_views'], again['points_views'])
+
+
+def test_multiview_is_deterministic_per_epoch(templates, tokenizer):
+    from symbolic_jepa.templates import DynamicConstantMultiViewDataset
+
+    ds = DynamicConstantMultiViewDataset(
+        templates, tokenizer, n_points=64, max_vars=1, n_views=2,
+        dynamic_constants=True,
+        sampler=ConstantSampler().fit(templates), constant_seed=42)
+
+    ds.set_epoch(1, stage='pretrain')
+    a = ds[0]['points_views'].clone()
+    ds.set_epoch(2, stage='pretrain')
+    b = ds[0]['points_views'].clone()
+    ds.set_epoch(1, stage='pretrain')
+    c = ds[0]['points_views'].clone()
+
+    assert not torch.equal(a, b), 'epoch did not advance the realisation'
+    assert torch.equal(a, c), 'epoch 1 did not replay'
+
+
+def test_multiview_split_matches_the_single_view_partition(templates,
+                                                           tokenizer):
+    """Same seed, same split — so multi-view and single-view stay comparable."""
+    from symbolic_jepa.templates import build_multiview_template_splits
+
+    single = build_template_splits(
+        templates, tokenizer, n_points=64, max_vars=1, seed=42,
+        dynamic_constants=True, sampler=ConstantSampler())
+    multi = build_multiview_template_splits(
+        templates, tokenizer, n_points=64, max_vars=1, seed=42,
+        n_views=2, dynamic_constants=True, sampler=ConstantSampler())
+
+    for a, b in zip(single, multi):
+        assert a.token_keys == b.token_keys
+    assert multi[0].n_views == 2
+    assert not multi[1].dynamic_constants and not multi[2].dynamic_constants
