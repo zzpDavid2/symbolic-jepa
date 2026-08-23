@@ -732,3 +732,70 @@ def test_multiview_split_matches_the_single_view_partition(templates,
         assert a.token_keys == b.token_keys
     assert multi[0].n_views == 2
     assert not multi[1].dynamic_constants and not multi[2].dynamic_constants
+
+
+def test_stage1_subsample_pretraining_leaves_the_decoder_untouched(templates,
+                                                                   tokenizer):
+    """Stage 1 trains the encoder only.
+
+    The optimizer is built over `model.encoder.parameters()` rather than by
+    freezing, so the decoder cannot take a gradient from the subsample
+    objective even by accident.
+    """
+    from symbolic_jepa import TNet, SymbolicTransformer
+    from symbolic_jepa.jepa import subsample_consistency_loss
+    from symbolic_jepa.templates import build_multiview_template_splits
+
+    train, _v, _t = build_multiview_template_splits(
+        templates, tokenizer, n_points=64, max_vars=1, seed=42, n_views=2,
+        pool_mult=4, dynamic_constants=True, sampler=ConstantSampler(),
+        constant_seed=2026)
+    train.set_epoch(1, stage='pretrain')
+
+    encoder = TNet(d_input=2, d_model=64)
+    model = SymbolicTransformer(encoder=encoder, vocab_size=len(tokenizer),
+                                d_model=64, n_heads=4, n_layers=2,
+                                max_seq_len=64, dropout=0.1)
+    opt = torch.optim.AdamW(list(model.encoder.parameters()), lr=1e-3)
+
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    model.train()
+    for i in range(4):
+        views = torch.stack([train[i]['points_views']])
+        opt.zero_grad()
+        z = [model.encoder(views[:, v]) for v in range(2)]
+        subsample_consistency_loss([z[0], z[1].detach()],
+                                   mode='centered').backward()
+        opt.step()
+
+    changed = {n for n, p in model.named_parameters()
+               if not torch.equal(p.detach(), before[n])}
+    assert changed, 'nothing trained at all'
+    assert all(n.startswith('encoder.') for n in changed), \
+        f'Stage 1 modified non-encoder parameters: {sorted(changed)[:5]}'
+    assert all(p.grad is None for n, p in model.named_parameters()
+               if not n.startswith('encoder.')), 'decoder received a gradient'
+
+
+def test_multiview_views_share_coefficients_and_target(templates, tokenizer):
+    """Views differ only by subsampling; coefficients and target are shared."""
+    from symbolic_jepa.templates import build_multiview_template_splits
+
+    train, _v, _t = build_multiview_template_splits(
+        templates, tokenizer, n_points=64, max_vars=1, seed=42, n_views=2,
+        pool_mult=4, dynamic_constants=True, sampler=ConstantSampler(),
+        constant_seed=2026)
+    train.set_epoch(2, stage='pretrain')
+
+    for idx in range(min(5, len(train))):
+        item = train[idx]
+        a, b = item['points_views'][0], item['points_views'][1]
+        assert not torch.equal(a, b), f'views identical at {idx}'
+        assert torch.equal(item['points'], a)
+        # One draw of coefficients backs both views.
+        pool, expr, _r, _f, _s = train.draw_realization(idx)
+        again = train.draw_realization(idx)[1]
+        assert np.array_equal(expr.values, again.values)
+        # Every view row comes from the shared pool.
+        assert torch.isfinite(item['points_views']).all()
+        assert torch.equal(item['input_ids'], train[idx]['input_ids'])

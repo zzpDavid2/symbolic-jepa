@@ -16,6 +16,7 @@ from symbolic_jepa.agreement import (
     load_details,
     load_run_matrix,
     mcnemar_exact,
+    paired_seed_report,
     stratified_agreement,
 )
 
@@ -191,3 +192,71 @@ def test_load_details_rejects_metrics_without_details(tmp_path):
     p.write_text(json.dumps({'exact_match': 0.0}))
     with pytest.raises(ValueError, match='no per-example'):
         load_details(p)
+
+
+# ---------------------------------------------------------------------------
+# Seed-level paired analysis — the primary test, distinct from pooled McNemar
+# ---------------------------------------------------------------------------
+
+def test_paired_seed_report_basic_statistics():
+    a = {42: 35.0, 7: 36.0, 123: 34.0, 3095: 35.5}
+    b = {42: 36.0, 7: 36.5, 123: 35.0, 3095: 36.0}
+
+    r = paired_seed_report(a, b, label='equiv', verbose=False)
+    assert r['n'] == 4
+    assert r['paired_mean'] == pytest.approx(0.75)
+    assert r['improved'] == 4 and r['worsened'] == 0 and r['tied'] == 0
+    assert r['ttest_p'] < 0.05
+    lo, hi = r['ci95']
+    assert lo < r['paired_mean'] < hi
+    assert r['per_seed'][123] == pytest.approx(1.0)
+
+
+def test_paired_seed_report_counts_ties_and_regressions():
+    a = {1: 10.0, 2: 10.0, 3: 10.0, 4: 10.0}
+    b = {1: 11.0, 2: 10.0, 3: 9.0, 4: 9.5}
+    r = paired_seed_report(a, b, verbose=False)
+    assert (r['improved'], r['tied'], r['worsened']) == (1, 1, 2)
+    assert r['paired_mean'] == pytest.approx(-0.125)
+
+
+def test_paired_seed_report_survives_identical_arms():
+    """All-zero differences make Wilcoxon undefined; must not crash."""
+    a = {1: 5.0, 2: 6.0, 3: 7.0}
+    r = paired_seed_report(a, dict(a), verbose=False)
+    assert r['paired_mean'] == 0.0
+    assert r['tied'] == 3
+    assert r['ci95'] == (0.0, 0.0)
+
+
+def test_paired_seed_report_needs_shared_seeds():
+    with pytest.raises(ValueError, match='no seeds in common'):
+        paired_seed_report({1: 1.0}, {2: 2.0}, verbose=False)
+
+
+def test_seed_level_and_pooled_mcnemar_can_disagree():
+    """Why the task says not to let pooled McNemar replace the seed analysis.
+
+    One seed carries a large example-level win while the other seeds regress.
+    Pooled over examples that looks like a decisive gain; across seeds — the
+    unit of replication for a training procedure — it is a wash.
+    """
+    runs_a, runs_b, per_seed_a, per_seed_b = {}, {}, {}, {}
+    for seed in (1, 2, 3, 4):
+        if seed == 1:
+            fa = [1] * 10 + [0] * 90
+            fb = [1] * 10 + [1] * 40 + [0] * 50      # +40 examples
+        else:
+            fa = [1] * 30 + [0] * 70
+            fb = [1] * 28 + [0] * 2 + [0] * 70       # -2 examples
+        runs_a[seed], runs_b[seed] = _details(fa), _details(fb)
+        per_seed_a[seed] = 100 * sum(fa) / len(fa)
+        per_seed_b[seed] = 100 * sum(fb) / len(fb)
+
+    pooled = compare_runs(runs_a, runs_b, verbose=False)['pooled']
+    assert pooled.only_b > pooled.only_a
+    assert pooled.pvalue() < 0.01, 'pooled test should look decisive here'
+
+    seed_level = paired_seed_report(per_seed_a, per_seed_b, verbose=False)
+    assert seed_level['improved'] == 1 and seed_level['worsened'] == 3
+    assert seed_level['ttest_p'] > 0.3, 'seed-level test should be a wash'

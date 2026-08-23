@@ -32,6 +32,8 @@ __all__ = [
     'load_details',
     'mcnemar_exact',
     'compare_runs',
+    'load_run_matrix',
+    'paired_seed_report',
     'stratified_agreement',
 ]
 
@@ -278,23 +280,100 @@ def compare_runs(runs_a: dict, runs_b: dict, metric: str = 'equiv',
 
 
 def load_run_matrix(root, pretrain_values: Sequence[int],
-                    seeds: Sequence[int],
-                    metrics_name: str = 'supervised/metrics.json') -> dict:
+                    seeds: Sequence,
+                    metrics_name: str = 'supervised/metrics.json',
+                    subdir=None) -> dict:
     """``{pretrain_epochs: {seed: details}}`` from a checkpoint tree.
 
     Skips runs whose ``metrics.json`` is missing, so a partially finished sweep
     still analyses.
+
+    Args:
+        subdir: Maps a *seeds* entry to its directory name.  Defaults to
+            ``seed_{s}``.  An experiment that separates model and data seeds
+            lays runs out differently, so the naming has to be injectable
+            rather than assumed.
     """
     root = Path(root)
+    name = subdir or (lambda s: f'seed_{s}')
     out: dict = {}
     for pe in pretrain_values:
         out[pe] = {}
         for seed in seeds:
-            path = root / f'pretrain_{pe}' / f'seed_{seed}' / metrics_name
+            path = root / f'pretrain_{pe}' / name(seed) / metrics_name
             if not path.exists():
                 continue
             try:
                 out[pe][seed] = load_details(path)
             except (ValueError, json.JSONDecodeError) as e:
                 print(f'[agreement] skipping {path}: {e}')
+    return out
+
+
+def paired_seed_report(values_a: dict, values_b: dict, label: str = 'metric',
+                       name_a: str = 'A', name_b: str = 'B',
+                       verbose: bool = True) -> dict:
+    """Seed-level paired comparison of a scalar metric.
+
+    This is the primary analysis, and it is **not** interchangeable with a
+    pooled McNemar over examples.  McNemar asks whether B wins discordant
+    *examples*; this asks whether B wins across independent *training runs*,
+    which is the question when the thing being compared is a training
+    procedure.  A pooled example-level test can be significant while the effect
+    fails to reproduce across seeds — the seeds are the unit of replication.
+
+    Args:
+        values_a, values_b: ``{seed: value}``, in the same units in and out.
+
+    Returns a dict with the paired mean, its 95% CI, both test p-values, and
+    the improved/tied/worsened split.
+    """
+    seeds = sorted(set(values_a) & set(values_b))
+    if not seeds:
+        raise ValueError('no seeds in common between the two arms')
+
+    a = np.array([values_a[s] for s in seeds], dtype=float)
+    b = np.array([values_b[s] for s in seeds], dtype=float)
+    d = b - a
+    n = len(d)
+
+    mean = float(d.mean())
+    sd = float(d.std(ddof=1)) if n > 1 else 0.0
+    se = sd / np.sqrt(n) if n > 1 else 0.0
+
+    t_p = wil_p = float('nan')
+    if n > 1 and sd > 0:
+        from scipy import stats
+        t_p = float(stats.ttest_rel(b, a).pvalue)
+        # Wilcoxon is undefined when every difference is zero, and warns when
+        # n is small; it is reported alongside t because a single outlying seed
+        # can carry a t-test that the rank test will not.
+        try:
+            wil_p = float(stats.wilcoxon(b, a).pvalue)
+        except ValueError:
+            wil_p = float('nan')
+        ci = 1.96 * se
+    else:
+        ci = 0.0
+
+    out = {
+        'label': label, 'seeds': seeds, 'n': n,
+        'mean_a': float(a.mean()), 'mean_b': float(b.mean()),
+        'paired_mean': mean, 'sd': sd, 'se': se,
+        'ci95': (mean - ci, mean + ci),
+        'ttest_p': t_p, 'wilcoxon_p': wil_p,
+        'improved': int((d > 0).sum()),
+        'tied': int((d == 0).sum()),
+        'worsened': int((d < 0).sum()),
+        'per_seed': {s: float(x) for s, x in zip(seeds, d)},
+    }
+
+    if verbose:
+        print(f'{label}: {name_a} {a.mean():.3f} -> {name_b} {b.mean():.3f}')
+        print(f'  paired mean  : {mean:+.3f}  (sd {sd:.3f}, n={n})')
+        print(f'  95% CI       : [{out["ci95"][0]:+.3f}, {out["ci95"][1]:+.3f}]')
+        print(f'  paired t     : p={t_p:.4g}')
+        print(f'  Wilcoxon     : p={wil_p:.4g}')
+        print(f'  improved/tied/worsened: {out["improved"]}/{out["tied"]}'
+              f'/{out["worsened"]}')
     return out

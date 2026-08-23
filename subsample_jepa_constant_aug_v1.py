@@ -14,23 +14,102 @@
 # ---
 
 # %% [markdown]
-# # Dynamic constant augmentation — `jepa_constant_aug_v1`
+# # Subsample JEPA on the canonical pipeline — `subsample_jepa_constant_aug_v1`
 #
-# Two-stage experiment as in `jepa_pretrain_v2_l8`, with one change: the
-# training set stores canonical *structures* and resamples their coefficients
-# every `__getitem__`, so one structure is seen under many realisations.
+# Same pipeline as `jepa_constant_aug_decoupled_v1` — canonical templates,
+# dynamic coefficients, decoupled seeds, 8 layers, same Stage 2 and evaluation.
+# **The only difference is the Stage-1 objective.**
+#
+# | | Stage-1 target |
+# |---|---|
+# | `jepa_constant_aug_decoupled_v1` | numeric encoder -> symbolic embedding |
+# | this notebook | numeric view A -> numeric view B (subsample invariance) |
+#
+# Both views come from **one** instantiated function: coefficients are drawn
+# once per item, one point pool is sampled, and the views are two subsamples of
+# that pool. Resampling coefficients per view would make the objective compare
+# different functions rather than different observations of one.
 #
 # ```text
-# c0*sin(c1*x1)+c2  ->  2.1*sin(0.8*x1)+4.3  ->  point cloud  ->  encoder
-#                       (new every epoch)
-# decoder target:   C sin C x1 + C           (never moves)
+# S -> theta -> f -> pool P -> view A
+#                          -> view B
 # ```
 #
-# Everything else matches `jepa_pretrain_v2_l8`, including the train/val/test
-# partition, so any metric difference is attributable to the augmentation.
+# Because everything else is held fixed, a difference against
+# `jepa_constant_aug_decoupled_v1` is attributable to the objective. Results are
+# **not** comparable to `subsample_jepa_v2`, which used the old fixed-expression
+# dataset and 4 layers.
 #
-# The canonical form is the split unit and coefficients are drawn only after
-# the split; section 4 asserts zero overlap. Val/test stay deterministic.
+# ## The question
+#
+# > Does exposing each symbolic structure to many numerical coefficient
+# > realisations improve structural learning, and make JEPA pretraining more
+# > useful?
+#
+# Deduplicating 200 000 raw strings by prefix token sequence leaves each
+# canonical form backed by exactly **one** coefficient realisation. The encoder
+# can therefore memorise a coefficient pattern rather than the structure its
+# target tokens actually describe — a plausible contributor to the project's
+# central gap (high teacher-forced token accuracy, low exact symbolic recovery).
+#
+# ```text
+# canonical structure     c0*sin(c1*x1) + c2
+#     |  sample constants
+#     v
+# numerical function      2.1*sin(0.8*x1) + 4.3     <- new every epoch
+#     |  sample x points
+#     v
+# point cloud             -> encoder
+#
+# decoder target          C sin C x1 + C            <- identical, always
+# ```
+#
+# ## What is held fixed
+#
+# Everything. Model (**8 layers**, matching `jepa_pretrain_v2_l8`), optimiser,
+# schedule, JEPA objective, tokenizer, evaluation, `SYNTH_SEED`, and the
+# raw-string horizon are unchanged, and `build_template_splits` reuses the same
+# `_split_indices` call as `build_synthetic_splits`, so **the train/val/test
+# partition is identical to the baseline's**. Any difference in the metrics is
+# attributable to the augmentation.
+#
+# The baseline to compare against is `jepa_pretrain_v2_l8` itself — that path is
+# untouched and still reads `data/synthetic.pkl`, so no backward-compatibility
+# switch is needed here. `DYNAMIC_CONSTANTS = False` remains available as a
+# same-notebook control (it serves each template's original realisation and
+# reproduces the baseline bit-for-bit, pinned by
+# `tests/test_constant_templates.py`), but it is not the default.
+#
+# ## Two independent seeds
+#
+# `jepa_constant_aug_v1` keys the augmentation on the run seed, so each model
+# init also gets its own coefficient trajectory — confounding variation from
+# initialisation with variation from *which* functions were sampled. Here:
+#
+# | seed | controls |
+# |---|---|
+# | `MODEL_SEED` | init, dropout, optimiser, DataLoader shuffle |
+# | `DATA_SEED` | coefficients, point clouds, augmentation retries |
+#
+# Shuffle stays on `MODEL_SEED` — it is which examples share a batch, i.e.
+# optimisation randomness, not a property of the data.
+#
+# The augmentation key becomes `(DATA_SEED, stage, epoch, idx, stream, attempt)`.
+#
+# **The comparison:** with the Stage-2 data trajectory held fixed, does 10-epoch
+# JEPA pretraining beat the no-pretraining control? Section 4b fingerprints the
+# Stage-2 data to assert the two arms really do see the same thing, and that
+# changing `DATA_SEED` moves it.
+#
+# ## No leakage
+#
+# The **canonical form is the split unit**, and coefficients are drawn only
+# after the split. Section 4 asserts the three pairwise overlaps are zero and
+# raises if not — we are measuring generalisation to unseen *structures*, not
+# the easier setting of a seen structure with new numbers.
+#
+# Validation and test stay deterministic: fixed structures, fixed coefficients,
+# fixed clouds. A moving evaluation set could not be compared across epochs.
 #
 # ```text
 # Stage 1  JEPA-only pretraining   (pretrain_epochs)
@@ -212,8 +291,11 @@ import symbolic_jepa  # noqa: E402
 _REQUIRED = {
     'symbolic_jepa.templates': (
         'AUGMENTATION_VERSION', 'templates_fingerprint',
-        'DynamicConstantMultiViewDataset', 'build_multiview_template_splits'),
-    'symbolic_jepa.agreement': ('compare_runs', 'load_run_matrix'),
+        'DynamicConstantMultiViewDataset', 'build_multiview_template_splits',
+        'stage2_fingerprint'),
+    'symbolic_jepa.jepa': ('subsample_consistency_loss',),
+    'symbolic_jepa.agreement': ('compare_runs', 'load_run_matrix',
+                                'paired_seed_report'),
 }
 for _mod_name, _names in _REQUIRED.items():
     try:
@@ -271,17 +353,20 @@ from symbolic_jepa import (
     PrefixTokenizer,
     TNet, SymbolicTransformer,
     JEPAPredictor, IdentityPredictor, jepa_loss,
+    subsample_consistency_loss,
     teacher_forced_counts,
     evaluate_predictions,
     sym_spread, pred_spread, retrieval_top1, common_mode,
 )
 from symbolic_jepa.datacache import DataCache, cached_prefix_tree
 from symbolic_jepa.templates import (
-    AUGMENTATION_VERSION, ConstantSampler, build_template_splits,
-    load_template_dataset, templates_fingerprint,
+    AUGMENTATION_VERSION, ConstantSampler, build_multiview_template_splits,
+    load_template_dataset, templates_fingerprint, stage2_fingerprint,
     canonical_split_report, describe_realizations, audit_constant_sampling,
 )
-from symbolic_jepa.agreement import compare_runs, load_run_matrix
+from symbolic_jepa.agreement import (
+    compare_runs, load_run_matrix, paired_seed_report,
+)
 from symbolic_jepa.checkpointing import (
     CheckpointError,
     validate_checkpoint, save_checkpoint_atomic, save_json_atomic,
@@ -329,7 +414,13 @@ print(f'Device: {DEVICE}')
 # checkpoints would LOAD here without complaint — only a distinct
 # EXPERIMENT_VERSION keeps one from being resumed into this run, and run_config
 # additionally carries every constant-sampling setting.
-EXPERIMENT_VERSION = 'jepa_constant_aug_v1'
+EXPERIMENT_VERSION = 'subsample_jepa_constant_aug_v1'
+
+# Recorded in every run_config. The previous experiment used the coupled policy
+# (augmentation keyed on the run seed); a checkpoint from it must never be
+# resumed here even though the weights are shape-compatible, and this field
+# makes that a structural impossibility rather than a naming convention.
+AUGMENTATION_SEED_POLICY = 'independent_data_seed'
 
 # Bump when DECODING or SCORING changes, independently of training. Trained
 # checkpoints stay valid; only metrics.json is invalidated, so affected runs
@@ -358,15 +449,36 @@ VAL_EVERY = 1
 USE_AMP = True
 
 # ── The comparison ─────────────────────────────────────────────────────
-# Eight seeds. The augmentation's effect on `equiv` / `R2>0.9` is ~0.7 pp with
-# a per-seed sd of ~0.5-0.7 pp, so three seeds cannot resolve it and eight can:
-# paired t p=0.018 (equiv) and p=0.004 (R2>0.9), 7/8 seeds positive.
 FINETUNE_EPOCHS = 30
 PRETRAIN_EPOCHS_VALUES = [0, 10]
-SEEDS = [42, 123, 7, 3095, 4003, 492, 4550, 6928]
+
+# Three model seeds first; widen to the full eight if the result is promising.
+MODEL_SEEDS = [42, 123, 7]
+
+# Data-side randomness: coefficients, point clouds, augmentation retries.
+# ONE precommitted data seed to start. The list is here so a follow-up can add
+# [2026, 31415, 271828] and test whether any effect survives a change of
+# augmentation trajectory — but that is a separate, later decision, and running
+# it now would turn a clean 16-run experiment into an underpowered 48-run one.
+DATA_SEEDS = [2026]
+
+# Alias so the plotting / inspection cells below keep reading naturally. The
+# unit of replication in this experiment is the MODEL seed.
+SEEDS = MODEL_SEEDS
 GLOBAL_SEED = SEEDS[0]        # notebook-level RNG; per-run seeds come from SEEDS
 
-# ── JEPA objective used in Stage 1 (unchanged from v1) ─────────────────
+# ── Subsample-JEPA objective (Stage 1) ─────────────────────────────────
+N_VIEWS = 2                   # subsamples per item per step
+POOL_MULT = 4                 # pool is N_POINTS*POOL_MULT before subsampling
+VIEW_POINTS = None            # points per view (None = N_POINTS)
+
+# 'centered' subtracts each view's batch mean before the cosine. Raw cosine
+# between two views of the same function starts ~0.99, giving almost no
+# gradient, and is minimised by total collapse; the centered form penalises it.
+SUBSAMPLE_LOSS = 'centered'   # 'centered' (recommended) | 'cosine'
+SUBSAMPLE_LOSS_OTHER = 'cosine' if SUBSAMPLE_LOSS == 'centered' else 'centered'
+
+# ── Symbolic-JEPA settings, kept for Stage-2 validation logging ────────
 JEPA_LOSS = 'cosine'          # 'cosine' (ordinary) | 'centered'
 JEPA_PREDICTOR = 'identity'   # 'identity' | 'mlp'
 PRETRAIN_STOPGRAD = True      # see the note below — False collapses Stage 1
@@ -407,11 +519,11 @@ CONSTANT_JITTER = 1.0         # >1 makes pooled draws continuous, not a grid
 # False = legacy global-RNG stream, reproducible only for an uninterrupted run.
 DETERMINISTIC_AUGMENTATION = True
 
-# The base seed is the RUN seed, assigned in train_one, so the two pretrain
-# arms at one seed see the same augmentation sequence and the comparison stays
-# paired. This placeholder only puts the dataset in deterministic mode and
-# makes the section-4 diagnostics representative of SEEDS[0].
-CONSTANT_SEED = SEEDS[0] if DETERMINISTIC_AUGMENTATION else None
+# The base seed is the DATA seed, assigned in train_one. Every model seed
+# therefore trains on the identical augmented trajectory, which is the whole
+# point of this notebook. This placeholder puts the dataset in deterministic
+# mode and makes the section-4 diagnostics representative of DATA_SEEDS[0].
+CONSTANT_SEED = DATA_SEEDS[0] if DETERMINISTIC_AUGMENTATION else None
 
 # Redraws before falling back to reference coefficients. Rejection catches a
 # near-zero coefficient erasing a branch, and blow-ups past CONSTANT_MAX_ABS.
@@ -758,10 +870,11 @@ print(f'\nconstant sampler: {CONSTANT_MODE} '
 # the live `Expression` objects anyway, so caching it would save little.
 
 # %%
-synth_train, synth_val, synth_test = build_template_splits(
+synth_train, synth_val, synth_test = build_multiview_template_splits(
     templates, tokenizer,
     n_points=N_POINTS, max_seq_len=MAX_SEQ, max_vars=MAX_VARS,
     seed=SYNTH_SEED,
+    n_views=N_VIEWS, pool_mult=POOL_MULT, view_points=VIEW_POINTS,
     dynamic_constants=DYNAMIC_CONSTANTS,
     sampler=CONSTANT_SAMPLER,
     constant_seed=CONSTANT_SEED,
@@ -820,6 +933,63 @@ describe_realizations(synth_train, n_forms=3, n_realizations=3, seed=0)
 
 # %%
 CONSTANT_AUDIT = audit_constant_sampling(synth_train, n=256, seed=0)
+
+# %% [markdown]
+# ## 4b. Stage-2 fingerprint — the paired-control assertion
+#
+# The experiment only means what it claims if, for a fixed
+# `(MODEL_SEED, DATA_SEED)`, the `pretrain_0` and `pretrain_10` arms train on
+# **identical** Stage-2 data. That holds by construction — the augmentation
+# keys on `(DATA_SEED, stage, epoch, idx)` and never on the model seed — but
+# "by construction" is exactly the kind of claim that rots silently, so it is
+# asserted rather than argued.
+#
+# The fingerprint hashes the instantiated coefficients, the raw point cloud,
+# the normalised tensor the encoder receives, and the target tokens, at fixed
+# sample indices across epochs 0/5/15/29.
+#
+# Three things are checked:
+#
+# 1. it does not move when the **model seed** changes — otherwise model
+#    randomness is leaking into the data;
+# 2. it *does* move when the **data seed** changes — otherwise `DATA_SEED` is
+#    an inert knob and the follow-up experiment would be meaningless;
+# 3. val/test are untouched by either.
+
+# %%
+_FP_EPOCHS = (0, 5, 15, 29)
+
+synth_train.constant_seed = DATA_SEEDS[0]
+STAGE2_FINGERPRINT = stage2_fingerprint(synth_train, epochs=_FP_EPOCHS)
+print(f'Stage-2 fingerprint @ DATA_SEED={DATA_SEEDS[0]}: {STAGE2_FINGERPRINT}')
+
+# 1. Model seed must not matter.
+for _ms in MODEL_SEEDS[:3]:
+    seed_everything(_ms)
+    _fp = stage2_fingerprint(synth_train, epochs=_FP_EPOCHS)
+    assert _fp == STAGE2_FINGERPRINT, (
+        f'model seed {_ms} changed the Stage-2 data ({_fp} != '
+        f'{STAGE2_FINGERPRINT}) — model randomness is leaking into the '
+        f'augmentation, and the paired control is void.')
+print(f'  unchanged across model seeds {MODEL_SEEDS[:3]}  [paired control OK]')
+
+# 2. Data seed must matter.
+_other = 31415
+synth_train.constant_seed = _other
+_fp_other = stage2_fingerprint(synth_train, epochs=_FP_EPOCHS)
+assert _fp_other != STAGE2_FINGERPRINT, (
+    f'DATA_SEED {_other} produced the same Stage-2 data as {DATA_SEEDS[0]} — '
+    f'the data seed is inert.')
+print(f'  changes with DATA_SEED ({_other} -> {_fp_other})  [knob is live]')
+
+# 3. Restore, and confirm val/test never moved.
+synth_train.constant_seed = DATA_SEEDS[0]
+assert stage2_fingerprint(synth_train, epochs=_FP_EPOCHS) == STAGE2_FINGERPRINT
+assert not synth_val.dynamic_constants and synth_val.constant_seed is None
+assert not synth_test.dynamic_constants and synth_test.constant_seed is None
+print('  val/test carry no data seed and stay deterministic  [OK]')
+
+seed_everything(GLOBAL_SEED)
 
 # %% [markdown]
 # ### Resume identity
@@ -942,13 +1112,24 @@ RUN_FILES = {
 }
 
 
-def run_paths(pretrain_epochs: int, seed: int) -> dict:
+def run_dirname(model_seed: int, data_seed: int) -> str:
+    """Directory name for one (model seed, data seed) pair.
+
+    Both appear in the path, so a sweep over data seeds cannot collide with an
+    existing run and the layout stays readable on disk.
+    """
+    return f'model_{model_seed}_data_{data_seed}'
+
+
+def run_paths(pretrain_epochs: int, seed: int, data_seed: int = None) -> dict:
     """THE single source of truth for v2 run paths.
 
     Every checkpoint, metric, manifest and TensorBoard directory derives from
     this — never from a hand-built f-string.
     """
-    rel = Path(f'pretrain_{pretrain_epochs}') / f'seed_{seed}'
+    if data_seed is None:
+        data_seed = DATA_SEEDS[0]
+    rel = Path(f'pretrain_{pretrain_epochs}') / run_dirname(seed, data_seed)
     paths = {'rel': rel, 'tb': LOCAL_LOG_ROOT / rel,
              'local_dir': LOCAL_CHECKPOINT_ROOT / rel}
     for key, sub in RUN_FILES.items():
@@ -970,7 +1151,8 @@ if DRIVE_CHECKPOINT_ROOT is None:
           'LOCAL ONLY and will be lost if this runtime dies.')
 
 # %%
-def make_run_config(pretrain_epochs: int, stage: str) -> dict:
+def make_run_config(pretrain_epochs: int, stage: str,
+                    model_seed: int = None, data_seed: int = None) -> dict:
     """Every setting that materially changes what a run means.
 
     Stored in each checkpoint and in metrics.json, and compared before anything
@@ -985,6 +1167,8 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
     token swaps.
     """
     assert stage in ('pretrain', 'supervised')
+    if data_seed is None:
+        data_seed = DATA_SEEDS[0]
     return {
         'experiment_version': EXPERIMENT_VERSION,
         'stage': stage,
@@ -1025,6 +1209,18 @@ def make_run_config(pretrain_epochs: int, stage: str) -> dict:
         'deterministic_augmentation': DETERMINISTIC_AUGMENTATION,
         'augmentation_version': AUGMENTATION_VERSION,
         'template_fingerprint': TEMPLATE_FINGERPRINT,
+        # Both seeds explicitly, plus the policy that relates them. A
+        # checkpoint from the coupled experiment carries neither `data_seed`
+        # nor this policy, so validate_checkpoint's exact run_config diff
+        # rejects it — the two experiments cannot cross-contaminate.
+        'model_seed': model_seed,
+        'data_seed': data_seed,
+        'augmentation_seed_policy': AUGMENTATION_SEED_POLICY,
+        'stage1_objective': 'subsample_invariance',
+        'subsample_loss': SUBSAMPLE_LOSS,
+        'n_views': N_VIEWS,
+        'pool_mult': POOL_MULT,
+        'view_points': VIEW_POINTS,
     }
 
 
@@ -1033,9 +1229,11 @@ LATEST_EXTRA = ('optimizer', 'scheduler', 'history', 'best_val', 'best_epoch')
 PRETRAIN_EXTRA = ('optimizer',)
 
 
-def make_validator(pretrain_epochs, seed, kind, stage, path=None):
+def make_validator(pretrain_epochs, seed, kind, stage, path=None,
+                   data_seed=None):
     """A one-argument validator for save/load helpers."""
-    cfg = make_run_config(pretrain_epochs, stage)
+    cfg = make_run_config(pretrain_epochs, stage, model_seed=seed,
+                          data_seed=data_seed)
     extra = {'latest': LATEST_EXTRA, 'pretrain': PRETRAIN_EXTRA}.get(kind, ())
     max_epoch = pretrain_epochs if stage == 'pretrain' else FINETUNE_EPOCHS
 
@@ -1079,16 +1277,18 @@ def backup_and_record(local_path, drive_path, manifest_path, verbose=True) -> bo
 
 # %%
 def run_pretraining(model, predictor, params, pretrain_epochs, seed,
-                    paths, writer, train_loader, train_gen, history):
+                    paths, writer, train_loader, train_gen, history,
+                    data_seed=None):
     """Stage 1: JEPA-only pretraining. Resumable, local-first."""
     if pretrain_epochs == 0:
         return
 
     # Stage 1 gets its OWN optimizer; Stage 2 builds a fresh one so no Adam
-    # moments or LR schedule carry across the objective switch.
+    # moments or LR schedule carry across the objective switch. `params` is the
+    # ENCODER's parameters only — the decoder is untouched in Stage 1.
     pre_opt = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
     validate = make_validator(pretrain_epochs, seed, 'pretrain', 'pretrain',
-                              path=paths['pre_latest'])
+                              path=paths['pre_latest'], data_seed=data_seed)
 
     start_epoch = 1
     ck, source = load_local_or_restore(
@@ -1107,7 +1307,7 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
             return
         print(f'  Stage 1 resuming at epoch {start_epoch} (source={source})')
 
-    print(f'\n=== Stage 1: JEPA pretraining '
+    print(f'\n=== Stage 1: subsample-invariance pretraining '
           f'({pretrain_epochs} epochs, loss = JEPA only) ===')
     print(f'  stopgrad={PRETRAIN_STOPGRAD}  trains='
           f'{"encoder only" if PRETRAIN_STOPGRAD else "encoder + decoder"}')
@@ -1125,65 +1325,68 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
         predictor.train()
         pre_sum = 0.0
         pre_n = 0
-        std_num_sum = std_sym_sum = 0.0
+        std_num_sum = other_sum = 0.0
 
         pbar = tqdm(train_loader, leave=False,
                     desc=f'{paths["rel"]} P{pe}/{pretrain_epochs}')
         for batch in pbar:
-            points = batch['points'].to(DEVICE, non_blocking=True)
-            input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
-            attn_mask = batch['attn_mask'].to(DEVICE, non_blocking=True)
+            # (batch, n_views, view_points, d) — every view is a subsample
+            # of ONE pool from ONE instantiated function.
+            views = batch['points_views'].to(DEVICE, non_blocking=True)
 
             pre_opt.zero_grad()
             with amp_ctx():
+                z_views = [model.encoder(views[:, v]) for v in range(N_VIEWS)]
                 if PRETRAIN_STOPGRAD:
-                    # eval() first: no_grad blocks gradients but leaves dropout
-                    # active, which would make the "fixed" target move.
-                    model.eval()
-                    with torch.no_grad():
-                        z_sym = model.encode_expression(
-                            input_ids, attn_mask=attn_mask)
-                    model.train()
+                    z_in = [z_views[0]] + [z.detach() for z in z_views[1:]]
                 else:
-                    z_sym = model.encode_expression(
-                        input_ids, attn_mask=attn_mask)
-                z_num = model.encoder(points)
-                loss_pre = jepa_loss(predictor(z_num), z_sym, mode=JEPA_LOSS)
+                    z_in = z_views
+                loss_pre = subsample_consistency_loss(z_in, mode=SUBSAMPLE_LOSS)
+                with torch.no_grad():
+                    loss_other = subsample_consistency_loss(
+                        [z.detach() for z in z_views],
+                        mode=SUBSAMPLE_LOSS_OTHER)
 
             loss_pre.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
+            # Encoder only — `params` is model.encoder.parameters(), and the
+            # decoder takes no gradient in Stage 1.
+            torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
             pre_opt.step()
 
             pre_sum += loss_pre.item()
+            other_sum += loss_other.item()
             pre_n += 1
             # Averaged over the epoch, not read off the last batch: a per-batch
             # reading jitters with which equations land last and would mask a
             # real collapse trend.
-            std_num_sum += z_num.detach().float().std(dim=0).mean().item()
-            std_sym_sum += z_sym.detach().float().std(dim=0).mean().item()
-            pbar.set_postfix({'jepa': f'{loss_pre.item():.4f}'})
+            std_num_sum += z_views[0].detach().float().std(dim=0).mean().item()
+            pbar.set_postfix({SUBSAMPLE_LOSS: f'{loss_pre.item():.4f}'})
         pbar.close()
         del pbar
 
         pre_avg = pre_sum / max(pre_n, 1)
+        other_avg = other_sum / max(pre_n, 1)
         std_num = std_num_sum / max(pre_n, 1)
-        std_sym = std_sym_sum / max(pre_n, 1)
         history.setdefault('pretrain_jepa', []).append(pre_avg)
+        history.setdefault('pretrain_other', []).append(other_avg)
         history.setdefault('pretrain_std_num', []).append(std_num)
-        history.setdefault('pretrain_std_sym', []).append(std_sym)
-        writer.add_scalar('pretrain/jepa_loss', pre_avg, pe)
+        writer.add_scalar(f'pretrain/{SUBSAMPLE_LOSS}', pre_avg, pe)
+        writer.add_scalar(f'pretrain/{SUBSAMPLE_LOSS_OTHER}', other_avg, pe)
         writer.add_scalar('pretrain/std_z_num', std_num, pe)
-        writer.add_scalar('pretrain/std_z_sym', std_sym, pe)
-        print(f'  P{pe}/{pretrain_epochs} | jepa={pre_avg:.4f} | '
-              f'std(z_num)={std_num:.4f} std(z_sym)={std_sym:.4f}')
+        # std(z) is the collapse guard: the centered loss can only be driven
+        # down by genuinely matching views, not by shrinking the embedding.
+        print(f'  P{pe}/{pretrain_epochs} | {SUBSAMPLE_LOSS}={pre_avg:.4f} | '
+              f'{SUBSAMPLE_LOSS_OTHER}={other_avg:.4f} | '
+              f'std(z_num)={std_num:.4f}')
 
         pre_ck = {
             'model': model.state_dict(),
             'optimizer': pre_opt.state_dict(),
             'epoch': pe,
             'seed': seed,
-            'run_config': make_run_config(pretrain_epochs, 'pretrain'),
+            'run_config': make_run_config(pretrain_epochs, 'pretrain',
+                                          model_seed=seed,
+                                          data_seed=data_seed),
             'history': {k: v for k, v in history.items()
                         if k.startswith('pretrain_')},
         }
@@ -1197,7 +1400,9 @@ def run_pretraining(model, predictor, params, pretrain_epochs, seed,
             'seed': seed,
             'pretrain_epochs': pretrain_epochs,
             'pretrain_latest_epoch': pe,
-            'run_config': make_run_config(pretrain_epochs, 'supervised'),
+            'run_config': make_run_config(pretrain_epochs, 'supervised',
+                                          model_seed=seed,
+                                          data_seed=data_seed),
         })
         if pe % DRIVE_BACKUP_EVERY == 0 or pe == pretrain_epochs:
             backup_and_record(paths['pre_latest'], paths['drive_pre_latest'],
@@ -1297,11 +1502,17 @@ def validate_epoch(model, predictor, val_loader, repr_loader=None):
 
 
 # %%
-def train_one(pretrain_epochs, seed, synth_train, synth_val):
+def train_one(pretrain_epochs, seed, synth_train, synth_val,
+              data_seed=None):
     """Train one (pretrain_epochs, seed) run. No eval — training + checkpoints."""
-    paths = run_paths(pretrain_epochs, seed)
+    if data_seed is None:
+        data_seed = DATA_SEEDS[0]
+    paths = run_paths(pretrain_epochs, seed, data_seed)
     run_tag = str(paths['rel'])
-    sup_cfg = make_run_config(pretrain_epochs, 'supervised')
+    # MODEL seed drives init / dropout / optimiser / shuffle; DATA seed drives
+    # the augmentation. Section 1 explains why shuffle stays on the model seed.
+    sup_cfg = make_run_config(pretrain_epochs, 'supervised',
+                              model_seed=seed, data_seed=data_seed)
 
     # Completion marker: metrics.json is a few KB, so an interrupted sync can
     # leave the ~200 MB latest.pt stale while metrics.json survives. Its
@@ -1332,14 +1543,19 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
     print(f'{"=" * 70}')
 
     model, encoder, predictor = build_model()
+    # Stage 2 trains everything; Stage 1 trains the ENCODER ONLY. Built
+    # explicitly rather than by freezing, so the decoder cannot take a gradient
+    # from the subsample objective even by accident.
     params = list(model.parameters()) + list(predictor.parameters())
+    pretrain_params = list(model.encoder.parameters())
 
-    # Bind the augmentation stream to THIS run's seed, before any loader is
-    # built. Both pretrain arms at one seed therefore see the same realisation
-    # for the same (stage, epoch, idx), which is what keeps the comparison
-    # paired on the data as well as on the weights.
+    # Bind the augmentation stream to the DATA seed, before any loader is
+    # built. Every model seed therefore trains on the identical augmented
+    # trajectory, and the two pretrain arms at one (model, data) pair see the
+    # same realisation for the same (stage, epoch, idx) — asserted by the
+    # Stage-2 fingerprint in section 4b.
     if DETERMINISTIC_AUGMENTATION:
-        synth_train.constant_seed = seed
+        synth_train.constant_seed = data_seed
 
     train_loader, train_gen = make_train_loader(synth_train, seed)
     val_loader = make_eval_loader(synth_val)
@@ -1350,9 +1566,11 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
         optimizer, T_max=FINETUNE_EPOCHS)
 
     latest_validate = make_validator(pretrain_epochs, seed, 'latest',
-                                     'supervised', path=paths['sup_latest'])
+                                     'supervised', path=paths['sup_latest'],
+                                     data_seed=data_seed)
     best_validate = make_validator(pretrain_epochs, seed, 'best',
-                                   'supervised', path=paths['sup_best'])
+                                   'supervised', path=paths['sup_best'],
+                                   data_seed=data_seed)
 
     start_epoch = 1
     best_val = float('inf')
@@ -1432,8 +1650,9 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
     # ── Stage 1 ────────────────────────────────────────────────────────
     # Skipped on resume: the pretrained weights are already inside sup_ck.
     if sup_ck is None:
-        run_pretraining(model, predictor, params, pretrain_epochs, seed,
-                        paths, writer, train_loader, train_gen, history)
+        run_pretraining(model, predictor, pretrain_params, pretrain_epochs, seed,
+                        paths, writer, train_loader, train_gen, history,
+                        data_seed=data_seed)
         optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=FINETUNE_EPOCHS)
@@ -1646,11 +1865,14 @@ def train_one(pretrain_epochs, seed, synth_train, synth_val):
 # come from different sessions and is a hard error.
 
 # %%
-def eval_one(pretrain_epochs, seed, synth_test):
+def eval_one(pretrain_epochs, seed, synth_test, data_seed=None):
     """Load best.pt and run greedy eval on the test set. Returns a metrics dict."""
-    paths = run_paths(pretrain_epochs, seed)
+    if data_seed is None:
+        data_seed = DATA_SEEDS[0]
+    paths = run_paths(pretrain_epochs, seed, data_seed)
     run_tag = str(paths['rel'])
-    sup_cfg = make_run_config(pretrain_epochs, 'supervised')
+    sup_cfg = make_run_config(pretrain_epochs, 'supervised',
+                              model_seed=seed, data_seed=data_seed)
 
     # Reuse a cached evaluation only if it came from THIS training config AND
     # THIS evaluator. A decoding change leaves the weights valid but the old
@@ -1670,9 +1892,11 @@ def eval_one(pretrain_epochs, seed, synth_test):
             return cached
 
     latest_validate = make_validator(pretrain_epochs, seed, 'latest',
-                                     'supervised', path=paths['sup_latest'])
+                                     'supervised', path=paths['sup_latest'],
+                                     data_seed=data_seed)
     best_validate = make_validator(pretrain_epochs, seed, 'best',
-                                   'supervised', path=paths['sup_best'])
+                                   'supervised', path=paths['sup_best'],
+                                   data_seed=data_seed)
 
     latest_ck, _ = load_local_or_restore(
         paths['sup_latest'], paths['drive_sup_latest'],
@@ -1716,6 +1940,8 @@ def eval_one(pretrain_epochs, seed, synth_test):
     metrics = {
         'experiment_version': EXPERIMENT_VERSION,
         'seed': seed,
+        'model_seed': seed,
+        'data_seed': data_seed,
         'run_tag': run_tag,
         'pretrain_epochs': pretrain_epochs,
         'run_config': sup_cfg,
@@ -1763,11 +1989,14 @@ def eval_one(pretrain_epochs, seed, synth_test):
 # Nothing above this cell starts training.
 
 # %% tags=["long-running"]
-print(f'Phase 1: training {len(PRETRAIN_EPOCHS_VALUES) * len(SEEDS)} runs '
-      f'({EXPERIMENT_VERSION})')
-for _pe in PRETRAIN_EPOCHS_VALUES:
-    for _seed in SEEDS:
-        train_one(_pe, _seed, synth_train, synth_val)
+_N_RUNS = len(PRETRAIN_EPOCHS_VALUES) * len(MODEL_SEEDS) * len(DATA_SEEDS)
+print(f'Phase 1: training {_N_RUNS} runs ({EXPERIMENT_VERSION})')
+print(f'  {len(MODEL_SEEDS)} model seeds x {len(DATA_SEEDS)} data seed(s) x '
+      f'{len(PRETRAIN_EPOCHS_VALUES)} pretrain settings')
+for _ds in DATA_SEEDS:
+    for _pe in PRETRAIN_EPOCHS_VALUES:
+        for _ms in MODEL_SEEDS:
+            train_one(_pe, _ms, synth_train, synth_val, data_seed=_ds)
 
 # %% tags=["long-running"]
 # An evaluation crash (SymPy timeout, OOM, bug) is an INFRASTRUCTURE failure,
@@ -1778,15 +2007,16 @@ print(f'\n{"=" * 70}')
 print(f'Phase 2: evaluating on the test set ({len(synth_test)} equations)')
 print(f'{"=" * 70}')
 
-_RUNS = [(p, s) for p in PRETRAIN_EPOCHS_VALUES for s in SEEDS]
+_RUNS = [(p, m, d) for d in DATA_SEEDS
+         for p in PRETRAIN_EPOCHS_VALUES for m in MODEL_SEEDS]
 successful_metrics = []
 failed_runs = []
 
-for _i, (_pe, _seed) in enumerate(_RUNS):
-    _tag = f'pretrain_{_pe}/seed_{_seed}'
+for _i, (_pe, _seed, _ds) in enumerate(_RUNS):
+    _tag = f'pretrain_{_pe}/{run_dirname(_seed, _ds)}'
     _t0 = time.time()
     try:
-        _m = eval_one(_pe, _seed, synth_test)
+        _m = eval_one(_pe, _seed, synth_test, data_seed=_ds)
         print(f'  [{_i + 1}/{len(_RUNS)}] {_tag}: '
               f'exact={_m["greedy_exact_match"] * 100:.1f}% | '
               f'equiv={_m["greedy_algebraic_equiv"] * 100:.1f}% | '
@@ -1797,6 +2027,7 @@ for _i, (_pe, _seed) in enumerate(_RUNS):
         print(f'  [{_i + 1}/{len(_RUNS)}] {_tag}: FAILED after '
               f'{time.time() - _t0:.0f}s — {type(_e).__name__}: {_e}')
         failed_runs.append({'pretrain_epochs': _pe, 'seed': _seed,
+                            'model_seed': _seed, 'data_seed': _ds,
                             'run_tag': _tag,
                             'error': f'{type(_e).__name__}: {_e}'})
     gc.collect()
@@ -1813,11 +2044,13 @@ for _i, (_pe, _seed) in enumerate(_RUNS):
 print(f'\n{"=" * 78}')
 print(f'{EXPERIMENT_VERSION} — n_test={len(synth_test)}')
 print(f'{"=" * 78}')
-print(f'\n{"pre_ep":>7} {"seed":>6} {"val_loss":>10} {"val_acc":>9} '
-      f'{"val_branch":>11} {"exact":>8} {"equiv":>8} {"R²>.9":>8}')
-print('-' * 78)
+print(f'\n{"pre_ep":>7} {"model":>7} {"data":>7} {"val_loss":>10} '
+      f'{"val_acc":>9} {"val_branch":>11} {"exact":>8} {"equiv":>8} '
+      f'{"R²>.9":>8}')
+print('-' * 88)
 for _m in successful_metrics:
-    print(f'{_m["pretrain_epochs"]:>7} {_m["seed"]:>6} '
+    print(f'{_m["pretrain_epochs"]:>7} {_m.get("model_seed", _m["seed"]):>7} '
+          f'{_m.get("data_seed", DATA_SEEDS[0]):>7} '
           f'{_m["best_val_loss"]:>10.4f} '
           f'{_m["best_val_acc"] * 100:>8.1f}% '
           f'{_m["best_val_branch_acc"] * 100:>10.1f}% '
@@ -1842,6 +2075,56 @@ for _pe in PRETRAIN_EPOCHS_VALUES:
           f'{np.mean([m["best_val_acc"] for m in _runs]) * 100:>11.1f}% '
           f'{np.mean([m["best_val_branch_acc"] for m in _runs]) * 100:>10.1f}% '
           f'{len(_runs):>6} {_nf:>7}')
+
+# %% [markdown]
+# ### Paired differences, by model seed
+#
+# The **model seed is the unit of replication**: each pair is one
+# initialisation trained twice on the *same* data trajectory, differing only in
+# whether Stage 1 ran. The pooled per-example McNemar further down answers a
+# different question (which arm wins discordant *examples*) and does not
+# replace this — a pooled example-level test can be significant while the
+# effect fails to reproduce across seeds.
+
+# %%
+PAIRED = {}
+_lo, _hi = min(PRETRAIN_EPOCHS_VALUES), max(PRETRAIN_EPOCHS_VALUES)
+
+for _ds in DATA_SEEDS:
+    _rows = {}
+    for _m in successful_metrics:
+        if _m.get('data_seed', DATA_SEEDS[0]) != _ds:
+            continue
+        _rows.setdefault(_m['pretrain_epochs'], {})[
+            _m.get('model_seed', _m['seed'])] = _m
+
+    if _lo not in _rows or _hi not in _rows:
+        print(f'data_seed {_ds}: need both arms evaluated, skipping')
+        continue
+
+    print(f'\n{"=" * 78}')
+    print(f'DATA_SEED = {_ds}   (pretrain_{_hi} - pretrain_{_lo})')
+    print(f'{"=" * 78}')
+    print(f'{"model_seed":>12}{"data_seed":>11}{"Δequiv":>10}{"ΔR²>.9":>10}')
+    _shared = sorted(set(_rows[_lo]) & set(_rows[_hi]))
+    for _ms in _shared:
+        _d_eq = 100 * (_rows[_hi][_ms]['greedy_algebraic_equiv']
+                       - _rows[_lo][_ms]['greedy_algebraic_equiv'])
+        _d_r2 = 100 * (_rows[_hi][_ms]['greedy_r2_above_0.9']
+                       - _rows[_lo][_ms]['greedy_r2_above_0.9'])
+        print(f'{_ms:>12}{_ds:>11}{_d_eq:>+10.2f}{_d_r2:>+10.2f}')
+
+    print()
+    PAIRED[_ds] = {}
+    for _key, _label in (('greedy_algebraic_equiv', 'equiv'),
+                         ('greedy_r2_above_0.9', 'R²>0.9'),
+                         ('greedy_exact_match', 'exact')):
+        _a = {s: 100 * _rows[_lo][s][_key] for s in _shared}
+        _b = {s: 100 * _rows[_hi][s][_key] for s in _shared}
+        PAIRED[_ds][_label] = paired_seed_report(
+            _a, _b, label=_label,
+            name_a=f'pretrain_{_lo}', name_b=f'pretrain_{_hi}')
+        print()
 
 if failed_runs:
     print(f'\n{len(failed_runs)} FAILED EVALUATION(S) — excluded from averages')
@@ -1870,8 +2153,8 @@ sync_local_runs_to_drive(LOCAL_CHECKPOINT_ROOT, DRIVE_CHECKPOINT_ROOT)
 import matplotlib.pyplot as plt
 
 
-def load_history(pretrain_epochs, seed):
-    p = run_paths(pretrain_epochs, seed)['history']
+def load_history(pretrain_epochs, seed, data_seed=None):
+    p = run_paths(pretrain_epochs, seed, data_seed)['history']
     if not p.exists():
         return None
     with open(p) as f:
@@ -1923,9 +2206,9 @@ def to_infix(prefix_str):
         return None, str(e)
 
 
-def inspect_run(pretrain_epochs, seed, n_show=10):
+def inspect_run(pretrain_epochs, seed, n_show=10, data_seed=None):
     """Show per-equation predictions from a run's metrics.json."""
-    p = run_paths(pretrain_epochs, seed)['metrics']
+    p = run_paths(pretrain_epochs, seed, data_seed)['metrics']
     if not p.exists():
         print(f'pretrain_{pretrain_epochs}/seed_{seed}: no metrics.json')
         return
@@ -1966,16 +2249,35 @@ for _p in PRETRAIN_EPOCHS_VALUES:
 # %% [markdown]
 # ## 12. Does JEPA solve a SUPERSET of the baseline, or a different set?
 #
-# The aggregate gap cannot separate **nested** (pretraining solves everything
-# the baseline does, plus more) from **rotated** (different sets of similar
-# size, the headline being the residue of a much larger churn).
+# This is a **secondary** analysis: it pools examples across seeds, whereas
+# the
+# section above pairs by model seed, which is the unit of replication for a
+# training procedure. Read it for the *shape* of the difference, not as a
+# significance test that overrides the seed-level result.
 #
-# Only discordant examples carry information — that is McNemar's test. Reads
-# the `details` already in every `metrics.json`; nothing is re-run. `churn` is
-# examples changed per unit of net gain: 1.0 is a pure addition.
+# The aggregate gap cannot tell these apart. Two arms a few tenths apart are
+# consistent with
+#
+# * **nested** — pretraining solves everything the baseline solves plus ~25
+#   more. A clean capability gain.
+# * **rotated** — the two arms solve substantially different sets of similar
+#   size, and +0.7 pp is the small residue of a much larger churn. Then the
+#   headline understates the run-to-run variance and the paired mean is a
+#   misleading summary.
+#
+# Only the **discordant** examples carry information about which arm is
+# better, which is exactly McNemar's test. This reads the per-example
+# `details` already stored in every `metrics.json` — nothing is re-run.
+#
+# `churn` is the number of examples that changed answer per unit of net gain.
+# 1.0 is a pure addition; 5.0 means five examples moved to gain one.
 
 # %%
-_matrix = load_run_matrix(LOCAL_CHECKPOINT_ROOT, PRETRAIN_EPOCHS_VALUES, SEEDS)
+# `subdir` because runs live under model_<m>_data_<d>, not seed_<s>.
+_DS = DATA_SEEDS[0]
+_matrix = load_run_matrix(
+    LOCAL_CHECKPOINT_ROOT, PRETRAIN_EPOCHS_VALUES, MODEL_SEEDS,
+    subdir=lambda m: run_dirname(m, _DS))
 
 AGREEMENT = {}
 for _metric in ('equiv', 'r2>0.9', 'exact'):

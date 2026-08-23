@@ -297,3 +297,80 @@ def test_deterministic_flag_reports_honestly(templates, tokenizer):
     np.random.seed(1)
     b = stochastic[0]['points']
     assert not torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# 6. Decoupled model seed / data seed
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_is_equal_for_arms_sharing_a_data_seed(templates,
+                                                           tokenizer):
+    """The paired-control requirement, as an assertion rather than an argument.
+
+    Two runs differing only in JEPA pretraining must see the SAME Stage-2
+    supervised data. Since the augmentation keys on the data seed and the stage
+    — never on the model seed — that holds by construction, and this pins it.
+    """
+    from symbolic_jepa.templates import stage2_fingerprint
+
+    arm_a, _v, _t = _train_split(templates, tokenizer, constant_seed=2026)
+    arm_b, _v2, _t2 = _train_split(templates, tokenizer, constant_seed=2026)
+
+    epochs = (0, 5, 15, 29)
+    fa = stage2_fingerprint(arm_a, epochs=epochs, n_indices=6)
+    fb = stage2_fingerprint(arm_b, epochs=epochs, n_indices=6)
+    assert fa == fb, 'same data seed produced different Stage-2 data'
+
+    # And a different data seed must move it, or the knob does nothing.
+    other, _v3, _t3 = _train_split(templates, tokenizer, constant_seed=31415)
+    assert stage2_fingerprint(other, epochs=epochs, n_indices=6) != fa
+
+
+def test_fingerprint_ignores_global_rng_and_restores_state(templates,
+                                                           tokenizer):
+    """Model-side randomness must not leak into the data fingerprint."""
+    from symbolic_jepa.templates import stage2_fingerprint
+
+    train, _v, _t = _train_split(templates, tokenizer, constant_seed=2026)
+    train.set_epoch(3, stage='pretrain')
+
+    np.random.seed(1)
+    torch.manual_seed(1)
+    first = stage2_fingerprint(train, epochs=(0, 5), n_indices=4)
+    assert (train.epoch, train.stage) == (3, 'pretrain'), 'state not restored'
+
+    np.random.seed(999)
+    torch.manual_seed(999)
+    assert stage2_fingerprint(train, epochs=(0, 5), n_indices=4) == first
+
+
+def test_fingerprint_covers_targets_not_just_clouds(templates, tokenizer):
+    """A changed token target must change the fingerprint."""
+    from symbolic_jepa.templates import stage2_fingerprint
+
+    train, _v, _t = _train_split(templates, tokenizer, constant_seed=2026)
+    before = stage2_fingerprint(train, epochs=(0, 1), n_indices=4)
+
+    saved = train.samples[0]['input_ids'].clone()
+    train.samples[0]['input_ids'] = saved.roll(1)
+    try:
+        assert stage2_fingerprint(train, epochs=(0, 1), n_indices=4) != before
+    finally:
+        train.samples[0]['input_ids'] = saved
+
+
+def test_data_seed_is_independent_of_model_seed(templates, tokenizer):
+    """Changing the model seed must not change what the data pipeline serves.
+
+    This is the whole point of the decoupling: with the data seed fixed, every
+    model initialisation trains on one identical augmented trajectory.
+    """
+    from symbolic_jepa.templates import stage2_fingerprint
+
+    train, _v, _t = _train_split(templates, tokenizer, constant_seed=2026)
+    fingerprints = set()
+    for model_seed in (42, 123, 7):
+        torch.manual_seed(model_seed)
+        np.random.seed(model_seed)
+        fingerprints.add(stage2_fingerprint(train, epochs=(0, 5), n_indices=5))
+    assert len(fingerprints) == 1, fingerprints

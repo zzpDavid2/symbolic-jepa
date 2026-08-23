@@ -99,6 +99,7 @@ __all__ = [
     'load_template_dataset',
     'pool_is_usable',
     'save_template_dataset',
+    'stage2_fingerprint',
     'templates_fingerprint',
     'templatize',
 ]
@@ -1340,6 +1341,55 @@ def describe_realizations(dataset: DynamicConstantPointCloudDataset,
         raise AssertionError(
             'Coefficient values changed the decoder token target.')
     return ok
+
+
+def stage2_fingerprint(dataset, epochs: Sequence[int] = (0, 5, 15, 29),
+                       indices: Optional[Sequence[int]] = None,
+                       n_indices: int = 8,
+                       stage: str = 'supervised') -> str:
+    """Hash of the realisations *dataset* serves at fixed ``(epoch, idx)``.
+
+    The point of decoupling the model seed from the data seed is that two runs
+    differing only in pretraining must see the *same* supervised data.  That
+    claim is easy to assert and easy to break silently, so it gets a fingerprint
+    rather than an argument: covering the instantiated coefficients, the raw
+    point cloud, the normalised tensor the encoder receives, and the target
+    tokens, over several epochs at fixed sample indices.
+
+    Depends only on the dataset's ``constant_seed`` (the data seed), never on
+    the model seed or on global RNG state.  So it is equal across two arms that
+    share a data seed, and different across data seeds — both worth checking.
+
+    The dataset's epoch/stage are restored before returning, so calling this
+    mid-experiment cannot perturb the run.
+    """
+    saved_epoch, saved_stage = dataset.epoch, dataset.stage
+    if indices is None:
+        step = max(1, len(dataset) // max(n_indices, 1))
+        indices = [i * step for i in range(n_indices) if i * step < len(dataset)]
+    indices = [int(i) for i in indices if 0 <= int(i) < len(dataset)]
+
+    h = hashlib.sha256()
+    h.update(f'{AUGMENTATION_VERSION}|{stage}|{list(epochs)}|{indices}'.encode())
+    try:
+        for epoch in epochs:
+            dataset.set_epoch(int(epoch), stage=stage)
+            for idx in indices:
+                item = dataset[idx]
+                h.update(np.ascontiguousarray(
+                    item['points'].numpy()).tobytes())
+                h.update(np.ascontiguousarray(
+                    item['input_ids'].numpy()).tobytes())
+                if dataset.dynamic_constants:
+                    pool, expr, _rej, _fb, _sub = dataset.draw_realization(idx)
+                    values = getattr(expr, 'values', None)
+                    if values is not None:
+                        h.update(np.asarray(values, dtype=np.float64).tobytes())
+                    h.update(np.ascontiguousarray(
+                        np.asarray(pool, dtype=np.float64)).tobytes())
+    finally:
+        dataset.epoch, dataset.stage = saved_epoch, saved_stage
+    return h.hexdigest()[:16]
 
 
 def audit_constant_sampling(dataset: DynamicConstantPointCloudDataset,
